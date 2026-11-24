@@ -22,6 +22,15 @@ semantic versioning.
 - Playwright browser tests for filtering, pagination, export downloads, list
   failures, request races, and authenticated asset downloads.
 - A reproducible 100k-asset benchmark script for list latency and full export.
+- Optional collection-aware uploads: the upload dialog preselects the current
+  library collection, lets the batch be filed or left unfiled, attaches duplicate
+  assets to the target, and reports per-file collection status.
+- User lifecycle management: create/edit forms, optional password reset,
+  disable/enable, permanent deletion for inactive users, self and last-admin
+  safeguards, and `token_version` session invalidation.
+- Upload progress rows now have explicit terminal states, clear stale rows
+  between batches, and time out instead of displaying an endless uploading
+  state.
 
 - Parse common XMP RDF fields into structured metadata, catalog fields, and
   full-text search.
@@ -53,6 +62,11 @@ semantic versioning.
   five-column desktop grid so 10-item pages form two complete rows.
 - Asset tag editing now has an explicit Add button beside the tag input; Enter
   continues to submit the same form.
+- The upload flow locks its collection and AI options while a batch is running,
+  clears stale status rows, and confirms before closing during active uploads.
+- User editing now validates roles, protects the current and last active admin,
+  and writes user lifecycle audit events. Permanent deletion requires the user
+  to be inactive first.
 - Keyword searches honor the selected time or metadata sort instead of always
   ordering by FTS relevance.
 - Tag and media facets use active assets and are no longer presented as counts

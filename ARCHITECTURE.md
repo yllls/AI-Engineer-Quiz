@@ -144,6 +144,24 @@ sequenceDiagram
   A-->>U: 201 with asset summary
 ```
 
+## Collection-aware uploads
+
+`POST /api/assets` accepts an optional `collection_id` form field alongside the
+files. The route validates that the collection exists before reading any file,
+then ingests the batch as before. Each newly created or deduplicated asset is
+linked to the target collection with `INSERT OR IGNORE`, so uploading an
+already-known file still files the existing asset. A per-item response reports
+`collection_added` or `collection_error`; an association failure does not discard
+the successfully uploaded asset. One `collection.add` audit event summarises the
+batch.
+
+The web upload dialog preselects the library's active collection filter while
+allowing "No collection" or another target. It locks the collection and AI
+controls during the batch, clears stale status rows between batches, and keeps
+one explicit status per file. A client wait timeout prevents a row from showing
+an endless uploading state; the user can refresh the library if the server
+finishes after the client stops waiting.
+
 ## Filtering, keyset pagination, and export
 
 `GET /api/assets` builds a `FilterSpec` and then a shared SQL query. Keyword
@@ -202,8 +220,9 @@ The base schema and ordered migrations live in `db.py`. `schema_meta` stores
 `schema_version`; `init_db` creates the base tables, then applies each pending
 migration in its own transaction. Version 1 adds the keyset and tag indexes.
 Version 2 adds the media facet index, `tag_usage`, its backfill, and the
-triggers that maintain it when asset-tag links or asset status change. A
-database newer than the running build is refused at startup.
+triggers that maintain it when asset-tag links or asset status change. Version 3
+adds `users.token_version` for session revocation. A database newer than the
+running build is refused at startup.
 
 ## Request and auth flow
 
@@ -222,7 +241,26 @@ flowchart TD
 
 Tokens are stateless HMAC payloads signed with a server secret (a minimal
 JWT-style scheme on the standard library), so there is no session store and no
-crypto dependency.
+crypto dependency. Each token also carries the user's `token_version`.
+Deactivation and password reset increment that value in the database, and
+`optional_user` rejects a token whose version no longer matches. Existing tokens
+without a version claim are treated as version 0.
+
+## User administration
+
+Admin-only user management edits email, full name, role, active state, and an
+optional new password. Username remains read-only because it is the login
+identifier and is snapshotted into audit history. Self-deactivation, self-role
+changes, and self-deletion are rejected. The last active administrator cannot be
+removed, demoted, or deactivated.
+
+Normal removal is reversible: the user is marked inactive and existing tokens
+stop validating, but the account can be enabled again. Permanent deletion is
+only available for inactive users and requires a typed confirmation in the UI.
+Before deleting the row, the server clears asset uploader, asset version creator,
+collection creator, share creator, and saved-search references; the audit log is
+retained with its historical username. All changes are audit-logged and no
+password values are recorded.
 
 ## Why it is shaped this way
 
