@@ -30,11 +30,7 @@
         <strong>Keepstack</strong>
       </div>
       <div class="search-box">
-        <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
+        <input id="search" type="search" maxlength="512" placeholder="Search assets, tags, metadata..." aria-label="Search assets">
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -47,42 +43,85 @@
 
     <div class="layout">
       <aside class="sidebar">
-        <nav class="nav">
+        <nav class="nav" aria-label="Primary">
           <button class="nav-item active" data-view="library">Library</button>
           <button class="nav-item" data-view="collections">Collections</button>
           <button class="nav-item admin-only" data-view="dashboard">Dashboard</button>
           <button class="nav-item admin-only" data-view="users">Users</button>
           <button class="nav-item admin-only" data-view="audit">Audit log</button>
         </nav>
-
-        <div id="facets" class="facets">
-          <div class="facet-group">
-            <h4>Media type</h4>
-            <ul id="facet-media"></ul>
-          </div>
-          <div class="facet-group">
-            <h4>Top tags</h4>
-            <ul id="facet-tags"></ul>
-          </div>
-        </div>
       </aside>
 
       <main class="content">
         <div id="view-library" class="view">
           <div class="view-head">
-            <h2 id="result-title">Library</h2>
+            <div class="view-heading">
+              <h2 id="result-title">Library</h2>
+              <div id="result-summary" class="result-summary"></div>
+            </div>
             <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
-              <select id="sort">
-                <option value="newest">Newest</option>
-                <option value="oldest">Oldest</option>
-                <option value="name">Name</option>
-                <option value="largest">Largest</option>
-              </select>
+              <label class="compact-field">Sort
+                <select id="sort" aria-label="Sort results">
+                  <option value="newest">Newest first</option>
+                  <option value="oldest">Oldest first</option>
+                  <option value="name">Name A-Z</option>
+                  <option value="largest">Largest first</option>
+                </select>
+              </label>
+              <label class="compact-field">Page size
+                <select id="page-size" aria-label="Assets per page">
+                  <option value="24">24</option>
+                  <option value="48">48</option>
+                  <option value="96">96</option>
+                </select>
+              </label>
+              <button id="btn-export" class="btn" type="button">Export CSV</button>
             </div>
           </div>
+
+          <section class="filter-panel" aria-label="Filter assets">
+            <div class="filter-controls">
+              <label class="filter-field">Media type
+                <select id="filter-media" aria-label="Filter by media type">
+                  <option value="">All types</option>
+                </select>
+              </label>
+              <label class="filter-field">Collection
+                <select id="filter-collection" aria-label="Filter by collection">
+                  <option value="">All collections</option>
+                </select>
+              </label>
+              <div class="filter-field tag-filter">
+                <label for="tag-search">Tags</label>
+                <div class="tag-picker">
+                  <input id="tag-search" type="search" maxlength="512" autocomplete="off"
+                         placeholder="Search tags to include or exclude"
+                         aria-controls="tag-results" aria-expanded="false">
+                  <div id="tag-results" class="tag-results hidden" role="listbox" aria-label="Tag suggestions"></div>
+                </div>
+              </div>
+              <button id="btn-clear-filters" class="btn btn-ghost clear-filters" type="button">Clear filters</button>
+            </div>
+            <div id="active-filters" class="active-filters" aria-live="polite"></div>
+          </section>
+
+          <div id="library-loading" class="library-state loading-state hidden" role="status">Loading assets...</div>
+          <div id="library-error" class="library-state error-state hidden" role="alert">
+            <p id="library-error-text"></p>
+            <button id="btn-retry" class="btn" type="button">Retry</button>
+          </div>
+
           <div id="grid" class="grid"></div>
-          <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+          <div id="empty" class="empty hidden">No matching assets.</div>
+
+          <nav id="pagination" class="pagination hidden" aria-label="Asset pagination">
+            <span id="pagination-summary" class="muted"></span>
+            <div class="pagination-controls">
+              <button id="prev-page" class="btn" type="button">Previous</button>
+              <span id="page-label" class="page-number"></span>
+              <button id="next-page" class="btn" type="button">Next</button>
+            </div>
+          </nav>
         </div>
 
         <div id="view-collections" class="view hidden">
@@ -123,7 +162,7 @@
   <div id="drawer" class="drawer hidden">
     <div class="drawer-backdrop"></div>
     <div class="drawer-panel">
-      <button id="drawer-close" class="drawer-close">&times;</button>
+      <button id="drawer-close" class="drawer-close" aria-label="Close asset details">&times;</button>
       <div id="drawer-body"></div>
     </div>
   </div>
@@ -145,7 +184,40 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <!-- CSV export modal -->
+  <div id="export-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="export-title">
+    <div class="modal-backdrop"></div>
+    <div class="modal-card export-card">
+      <button class="x" id="export-close" type="button" aria-label="Close export dialog">&times;</button>
+      <h3 id="export-title">Export CSV</h3>
+      <p id="export-count" class="muted"></p>
+      <div id="export-filters" class="export-filters"></div>
+
+      <section class="export-section">
+        <h4>Required columns</h4>
+        <div id="export-required" class="column-grid"></div>
+      </section>
+      <section class="export-section">
+        <h4>Optional columns</h4>
+        <div id="export-optional" class="column-grid"></div>
+      </section>
+
+      <label class="check">
+        <input type="checkbox" id="export-sanitize" checked>
+        Protect against spreadsheet formula injection
+      </label>
+      <p class="muted export-hint">Adds a leading apostrophe to text cells beginning with =, +, -, @, tab or carriage return.</p>
+      <p id="export-error" class="error hidden" role="alert"></p>
+
+      <div class="modal-actions">
+        <button id="export-reset-columns" class="btn btn-ghost" type="button">Reset columns</button>
+        <button id="export-cancel" class="btn" type="button">Cancel</button>
+        <button id="export-download" class="btn btn-primary" type="button">Download CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <script src="/app.js"></script>
 </body>

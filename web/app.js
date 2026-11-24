@@ -1,286 +1,1245 @@
 /* Keepstack single-page client. Vanilla JS, no build step. */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
 
-// ---------- API helper ----------
-async function api(path, opts = {}) {
-  const headers = opts.headers || {};
-  if (state.token) headers["Authorization"] = "Bearer " + state.token;
-  if (opts.json) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
-  const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) { logout(); throw new Error("unauthorised"); }
-  if (!res.ok) { const t = await res.text(); throw new Error(t || res.statusText); }
-  return res.headers.get("content-type")?.includes("json") ? res.json() : res;
+const SORT_VALUES = ["newest", "oldest", "name", "largest"];
+const SORT_LABELS = {
+  newest: "Newest first",
+  oldest: "Oldest first",
+  name: "Name A-Z",
+  largest: "Largest first",
+};
+const PAGE_SIZES = [24, 48, 96];
+const PAGE_SIZE_KEY = "keepstack_page_size";
+const EXPORT_PREFS_KEY = "keepstack_export_optional_columns";
+
+const REQUIRED_EXPORT_COLUMNS = [
+  ["uuid", "UUID"],
+  ["title", "Title"],
+  ["description", "Description"],
+  ["filename", "Filename"],
+  ["media_type", "Media type"],
+  ["tags", "Tags"],
+  ["created_at", "Created at"],
+];
+const OPTIONAL_EXPORT_COLUMNS = [
+  ["alt_text", "Alt text"],
+  ["mime_type", "MIME type"],
+  ["size", "Size"],
+  ["width", "Width"],
+  ["height", "Height"],
+  ["updated_at", "Updated at"],
+  ["dc_creator", "Creator"],
+  ["dc_subject", "Subject"],
+  ["dc_publisher", "Publisher"],
+  ["dc_date", "Date"],
+  ["license", "License"],
+  ["rights_statement", "Rights statement"],
+  ["credit", "Credit"],
+  ["usage_expiry", "Usage expiry"],
+  ["retention_until", "Retention until"],
+];
+const OPTIONAL_COLUMN_KEYS = new Set(OPTIONAL_EXPORT_COLUMNS.map(([key]) => key));
+
+function esc(s) {
+  return (s ?? "").toString().replace(/[&<>"]/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+  }[c]));
 }
+
+function normalizeTag(raw) {
+  return (raw ?? "").toString().trim().toLowerCase();
+}
+
+function uniqueTags(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values || []) {
+    const tag = normalizeTag(raw);
+    if (tag && !seen.has(tag)) {
+      seen.add(tag);
+      out.push(tag);
+    }
+  }
+  return out;
+}
+
+function parsePageSize(raw) {
+  const value = Number(raw);
+  return PAGE_SIZES.includes(value) ? value : 24;
+}
+
+function loadExportPreferences() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(EXPORT_PREFS_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter(key => OPTIONAL_COLUMN_KEYS.has(key)) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+const initialParams = new URLSearchParams(window.location.search);
+const initialCollectionRaw = initialParams.get("collection_id") || "";
+const initialCollection = /^\d+$/.test(initialCollectionRaw) && Number(initialCollectionRaw) > 0
+  ? initialCollectionRaw
+  : null;
+const initialSort = SORT_VALUES.includes(initialParams.get("sort"))
+  ? initialParams.get("sort")
+  : "newest";
+const initialPageSize = parsePageSize(localStorage.getItem(PAGE_SIZE_KEY) || "24");
+
+const state = {
+  token: localStorage.getItem("keepstack_token"),
+  user: null,
+  q: initialParams.get("q") || "",
+  media: (initialParams.get("media_type") || "").trim() || null,
+  collection: initialCollection,
+  includeTags: uniqueTags(initialParams.getAll("tags")).sort(),
+  excludeTags: uniqueTags(initialParams.getAll("exclude_tags")).sort(),
+  sort: initialSort,
+  pageSize: initialPageSize,
+  pageIndex: 0,
+  cursorStack: [null],
+  nextCursor: null,
+  prevCursor: null,
+  total: 0,
+  loading: false,
+  libraryOK: false,
+  collections: [],
+  collectionsLoaded: false,
+  tagCandidates: [],
+  exportOptional: loadExportPreferences(),
+  exportLastFocus: null,
+};
+
+let listGeneration = 0;
+let listAbort = null;
+let pendingListTimer = null;
+let tagGeneration = 0;
+let tagAbort = null;
+let tagInputTimer = null;
+let toastTimer = null;
+
+const fmtBytes = (b) => {
+  if (!b) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + " " + units[i];
+};
 
 function toast(msg, kind = "ok") {
-  const t = $("#toast"); t.textContent = msg; t.className = "toast " + kind;
-  setTimeout(() => t.classList.add("hidden"), 2600);
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = "toast " + kind;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
 }
-const fmtBytes = (b) => { if (!b) return "0 B"; const u = ["B","KB","MB","GB","TB"]; const i = Math.floor(Math.log(b)/Math.log(1024)); return (b/Math.pow(1024,i)).toFixed(i?1:0)+" "+u[i]; };
-const esc = (s) => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-// ---------- auth ----------
+class ApiError extends Error {
+  constructor(message, { status = 0, detail = null } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.code = detail && typeof detail === "object" ? detail.code : null;
+  }
+}
+
+async function responseError(res) {
+  let detail = null;
+  let message = res.statusText || `Request failed (${res.status})`;
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    try {
+      const payload = await res.json();
+      detail = payload && Object.prototype.hasOwnProperty.call(payload, "detail")
+        ? payload.detail
+        : payload;
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (Array.isArray(detail)) {
+        message = "Invalid request parameters";
+      } else if (detail && typeof detail === "object" && detail.message) {
+        message = detail.message;
+      }
+    } catch {
+      /* keep the HTTP status text */
+    }
+  } else {
+    try {
+      const text = await res.text();
+      if (text) message = text.slice(0, 500);
+    } catch {
+      /* ignore unread body */
+    }
+  }
+  return new ApiError(message, { status: res.status, detail });
+}
+
+function authHeaders() {
+  return state.token ? { Authorization: "Bearer " + state.token } : {};
+}
+
+async function api(path, opts = {}) {
+  const { json, headers: extraHeaders, ...rest } = opts;
+  const headers = new Headers(extraHeaders || {});
+  if (state.token) headers.set("Authorization", "Bearer " + state.token);
+  let body = rest.body;
+  if (json !== undefined) {
+    headers.set("Content-Type", "application/json");
+    body = JSON.stringify(json);
+  }
+  const method = rest.method || (json !== undefined ? "POST" : "GET");
+  const res = await fetch(path, { ...rest, method, headers, body });
+  if (res.status === 401) {
+    logout();
+    throw new ApiError("Your session expired. Sign in again.", { status: 401 });
+  }
+  if (!res.ok) throw await responseError(res);
+  return (res.headers.get("content-type") || "").includes("json") ? res.json() : res;
+}
+
+function syncModalState() {
+  const open = !$("#drawer").classList.contains("hidden")
+    || !$("#upload-modal").classList.contains("hidden")
+    || !$("#export-modal").classList.contains("hidden");
+  document.body.classList.toggle("modal-open", open);
+}
+
+function logout() {
+  state.token = null;
+  state.user = null;
+  localStorage.removeItem("keepstack_token");
+  invalidateListRequest();
+  if (tagAbort) tagAbort.abort();
+  closeExportModal();
+  closeTagResults();
+  $("#drawer").classList.add("hidden");
+  $("#upload-modal").classList.add("hidden");
+  $("#app").classList.add("hidden");
+  $("#login").classList.remove("hidden");
+  $("#user-label").textContent = "";
+  syncModalState();
+}
+
+function hasActiveFilters() {
+  return Boolean(
+    state.q.trim()
+    || state.media
+    || state.collection
+    || state.includeTags.length
+    || state.excludeTags.length
+  );
+}
+
+function syncUrl() {
+  const params = new URLSearchParams();
+  if (state.q) params.set("q", state.q);
+  if (state.media) params.set("media_type", state.media);
+  if (state.collection) params.set("collection_id", state.collection);
+  state.includeTags.forEach(tag => params.append("tags", tag));
+  state.excludeTags.forEach(tag => params.append("exclude_tags", tag));
+  params.set("sort", state.sort);
+  const url = new URL(window.location.href);
+  url.search = params.toString();
+  window.history.replaceState(null, "", url);
+}
+
+function collectionName(id) {
+  const item = state.collections.find(collection => String(collection.id) === String(id));
+  return item ? item.name : `Collection #${id}`;
+}
+
+function renderActiveFilters() {
+  const chips = [];
+  if (state.q.trim()) {
+    chips.push(`<span class="filter-chip keyword">
+      <span class="filter-label">Keyword</span><span class="filter-value">${esc(state.q.trim())}</span>
+      <button type="button" class="chip-btn" data-action="remove-keyword" aria-label="Remove keyword filter">&times;</button>
+    </span>`);
+  }
+  if (state.media) {
+    chips.push(`<span class="filter-chip keyword">
+      <span class="filter-label">Media</span><span class="filter-value">${esc(state.media)}</span>
+      <button type="button" class="chip-btn" data-action="remove-media" aria-label="Remove media type filter">&times;</button>
+    </span>`);
+  }
+  if (state.collection) {
+    chips.push(`<span class="filter-chip keyword">
+      <span class="filter-label">Collection</span><span class="filter-value">${esc(collectionName(state.collection))}</span>
+      <button type="button" class="chip-btn" data-action="remove-collection" aria-label="Remove collection filter">&times;</button>
+    </span>`);
+  }
+  state.includeTags.forEach(tag => {
+    chips.push(`<span class="filter-chip tag-chip include" data-tag="${esc(tag)}" data-mode="include">
+      <span class="filter-label">Include</span><span class="filter-value">${esc(tag)}</span>
+      <button type="button" class="chip-btn" data-action="toggle-tag" data-mode="include" data-tag="${esc(tag)}"
+              aria-label="Move tag ${esc(tag)} to excluded">&#8644;</button>
+      <button type="button" class="chip-btn" data-action="remove-tag" data-mode="include" data-tag="${esc(tag)}"
+              aria-label="Remove included tag ${esc(tag)}">&times;</button>
+    </span>`);
+  });
+  state.excludeTags.forEach(tag => {
+    chips.push(`<span class="filter-chip tag-chip exclude" data-tag="${esc(tag)}" data-mode="exclude">
+      <span class="filter-label">Exclude</span><span class="filter-value">${esc(tag)}</span>
+      <button type="button" class="chip-btn" data-action="toggle-tag" data-mode="exclude" data-tag="${esc(tag)}"
+              aria-label="Move tag ${esc(tag)} to included">&#8644;</button>
+      <button type="button" class="chip-btn" data-action="remove-tag" data-mode="exclude" data-tag="${esc(tag)}"
+              aria-label="Remove excluded tag ${esc(tag)}">&times;</button>
+    </span>`);
+  });
+  $("#active-filters").innerHTML = chips.join("");
+  $("#active-filters").classList.toggle("hidden", chips.length === 0);
+  $("#btn-clear-filters").disabled = chips.length === 0;
+}
+
+function setFilterControls() {
+  $("#search").value = state.q;
+  $("#sort").value = state.sort;
+  $("#page-size").value = String(state.pageSize);
+  $("#filter-media").value = state.media || "";
+  $("#filter-collection").value = state.collection || "";
+}
+
+function renderMediaOptions(mediaTypes) {
+  const select = $("#filter-media");
+  const values = [];
+  const seen = new Set();
+  for (const item of mediaTypes || []) {
+    const value = item && item.value;
+    if (value && !seen.has(value)) {
+      seen.add(value);
+      values.push(value);
+    }
+  }
+  if (state.media && !seen.has(state.media)) values.push(state.media);
+  select.innerHTML = '<option value="">All types</option>' +
+    values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join("");
+  select.value = state.media || "";
+}
+
+function renderCollectionOptions() {
+  const select = $("#filter-collection");
+  const current = state.collection;
+  const items = [...state.collections].sort((a, b) => a.name.localeCompare(b.name));
+  select.innerHTML = '<option value="">All collections</option>' +
+    items.map(collection => `<option value="${collection.id}">${esc(collection.name)}</option>`).join("");
+  if (current && !items.some(collection => String(collection.id) === String(current))) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = `Collection #${current}`;
+    select.appendChild(option);
+  }
+  select.value = current || "";
+}
+
+function invalidateListRequest() {
+  listGeneration += 1;
+  if (listAbort) {
+    listAbort.abort();
+    listAbort = null;
+  }
+  if (pendingListTimer) {
+    clearTimeout(pendingListTimer);
+    pendingListTimer = null;
+  }
+}
+
+function resetPaginationState() {
+  state.pageIndex = 0;
+  state.cursorStack = [null];
+  state.nextCursor = null;
+  state.prevCursor = null;
+}
+
+function setLibraryLoading(loading) {
+  state.loading = loading;
+  $("#library-loading").classList.toggle("hidden", !loading);
+  $("#btn-export").disabled = loading || !state.libraryOK;
+  if (loading) {
+    $("#library-error").classList.add("hidden");
+    $("#empty").classList.add("hidden");
+    $("#pagination").classList.add("hidden");
+    $("#result-summary").textContent = "Loading...";
+    $("#grid").innerHTML = "";
+  }
+}
+
+function showLibraryError(message) {
+  state.libraryOK = false;
+  $("#library-loading").classList.add("hidden");
+  $("#library-error-text").textContent = message || "Could not load assets.";
+  $("#library-error").classList.remove("hidden");
+  $("#grid").innerHTML = "";
+  $("#empty").classList.add("hidden");
+  $("#pagination").classList.add("hidden");
+  $("#result-summary").textContent = "Load failed";
+  $("#btn-export").disabled = true;
+}
+
+function hasMoreFilters() {
+  return hasActiveFilters();
+}
+
+function buildListParams(cursor) {
+  const params = new URLSearchParams();
+  params.set("limit", String(state.pageSize));
+  params.set("sort", state.sort);
+  if (state.q) params.set("q", state.q);
+  if (state.media) params.set("media_type", state.media);
+  if (state.collection) params.set("collection_id", state.collection);
+  state.includeTags.forEach(tag => params.append("tags", tag));
+  state.excludeTags.forEach(tag => params.append("exclude_tags", tag));
+  if (cursor) params.set("cursor", cursor);
+  return params;
+}
+
+function updateCursorState(data, navigation, requestedCursor) {
+  const pagination = data.pagination || { page: 1 };
+  const page = Number(pagination.page) || 1;
+  const index = Math.max(0, page - 1);
+  state.pageIndex = index;
+  state.nextCursor = pagination.next_cursor || null;
+  state.prevCursor = pagination.prev_cursor || null;
+
+  if (navigation === "initial") {
+    state.cursorStack = [requestedCursor || null];
+    state.pageIndex = 0;
+  } else if (navigation === "next") {
+    state.cursorStack = state.cursorStack.slice(0, index);
+    state.cursorStack[index] = requestedCursor;
+  } else if (navigation === "prev") {
+    state.cursorStack = state.cursorStack.slice(0, index + 1);
+  } else {
+    state.cursorStack = state.cursorStack.slice(0, index + 1);
+    if (state.cursorStack[index] === undefined) {
+      state.cursorStack[index] = requestedCursor || null;
+    }
+  }
+}
+
+function renderResults(data) {
+  state.total = Number(data.total) || 0;
+  state.libraryOK = true;
+  $("#btn-export").disabled = false;
+  renderMediaOptions(data.facets && data.facets.media_types);
+  $("#library-loading").classList.add("hidden");
+  $("#library-error").classList.add("hidden");
+
+  const filtered = hasMoreFilters();
+  $("#result-title").textContent = filtered ? "Filtered library" : "Library";
+  $("#result-summary").textContent = `${state.total} asset${state.total === 1 ? "" : "s"}`;
+
+  const items = data.items || [];
+  $("#grid").innerHTML = items.map(asset => `
+    <div class="card" data-uuid="${esc(asset.uuid)}">
+      <img class="thumb" loading="lazy" src="/api/assets/${esc(asset.uuid)}/thumb" alt="${esc(asset.alt_text || asset.title || asset.filename)}">
+      <div class="meta">
+        <span class="title" title="${esc(asset.title || asset.filename)}">${esc(asset.title || asset.filename)}</span>
+        <span class="sub"><span class="badge">${esc(asset.media_type)}</span><span>${fmtBytes(asset.size)}</span></span>
+      </div>
+    </div>`).join("");
+
+  const empty = $("#empty");
+  if (items.length === 0) {
+    empty.textContent = filtered
+      ? "No matching assets. Adjust or clear the filters."
+      : "No assets yet. Upload some to get started.";
+    empty.classList.remove("hidden");
+  } else {
+    empty.classList.add("hidden");
+  }
+
+  const pagination = data.pagination || { page: 1 };
+  const page = Number(pagination.page) || 1;
+  const paginationEl = $("#pagination");
+  if (state.total > 0) {
+    paginationEl.classList.remove("hidden");
+    $("#pagination-summary").textContent = `${state.total} matching asset${state.total === 1 ? "" : "s"}`;
+    $("#page-label").textContent = `Page ${page}`;
+    $("#prev-page").disabled = !state.prevCursor;
+    $("#next-page").disabled = !state.nextCursor;
+  } else {
+    paginationEl.classList.add("hidden");
+  }
+}
+
+async function startListRequest({ cursor = null, navigation = "initial", allowCursorReset = true } = {}) {
+  const generation = ++listGeneration;
+  if (pendingListTimer) {
+    clearTimeout(pendingListTimer);
+    pendingListTimer = null;
+  }
+  if (listAbort) listAbort.abort();
+  const controller = new AbortController();
+  listAbort = controller;
+  setLibraryLoading(true);
+
+  try {
+    const params = buildListParams(cursor);
+    const data = await api("/api/assets?" + params.toString(), { signal: controller.signal });
+    if (generation !== listGeneration) return;
+    updateCursorState(data, navigation, cursor);
+    renderResults(data);
+  } catch (err) {
+    if (err.name === "AbortError" || generation !== listGeneration) return;
+    if (err instanceof ApiError && err.code === "invalid_cursor" && allowCursorReset) {
+      toast("Pagination state expired. Showing the first page.", "err");
+      resetPaginationState();
+      startListRequest({ cursor: null, navigation: "initial", allowCursorReset: false });
+      return;
+    }
+    showLibraryError(err.message || "Could not load assets.");
+  } finally {
+    if (generation === listGeneration) {
+      listAbort = null;
+      setLibraryLoading(false);
+    }
+  }
+}
+
+function queueFilterReload({ delay = 0 } = {}) {
+  invalidateListRequest();
+  resetPaginationState();
+  syncUrl();
+  renderActiveFilters();
+  setLibraryLoading(true);
+  if (delay > 0) {
+    pendingListTimer = setTimeout(() => {
+      pendingListTimer = null;
+      startListRequest({ cursor: null, navigation: "initial" });
+    }, delay);
+  } else {
+    startListRequest({ cursor: null, navigation: "initial" });
+  }
+}
+
+function reloadCurrentPage() {
+  invalidateListRequest();
+  const cursor = state.pageIndex === 0
+    ? null
+    : (state.cursorStack[state.pageIndex] || state.prevCursor || null);
+  startListRequest({ cursor, navigation: "refresh" });
+}
+
+function previousPage() {
+  if (!state.prevCursor) return;
+  invalidateListRequest();
+  const cursor = state.prevCursor;
+  startListRequest({ cursor, navigation: "prev" });
+}
+
+function nextPage() {
+  if (!state.nextCursor) return;
+  invalidateListRequest();
+  const cursor = state.nextCursor;
+  startListRequest({ cursor, navigation: "next" });
+}
+
+function clearFilters() {
+  state.q = "";
+  state.media = null;
+  state.collection = null;
+  state.includeTags = [];
+  state.excludeTags = [];
+  $("#search").value = "";
+  $("#filter-media").value = "";
+  $("#filter-collection").value = "";
+  closeTagResults();
+  queueFilterReload();
+}
+
+function addTag(raw, mode = "include") {
+  const tag = normalizeTag(raw);
+  if (!tag) return;
+  if (mode === "include") {
+    state.excludeTags = state.excludeTags.filter(value => value !== tag);
+    if (!state.includeTags.includes(tag)) state.includeTags.push(tag);
+    state.includeTags.sort();
+  } else {
+    state.includeTags = state.includeTags.filter(value => value !== tag);
+    if (!state.excludeTags.includes(tag)) state.excludeTags.push(tag);
+    state.excludeTags.sort();
+  }
+  renderActiveFilters();
+  renderTagCandidates(state.tagCandidates);
+  queueFilterReload();
+}
+
+function removeTag(tag, mode) {
+  if (mode === "include") state.includeTags = state.includeTags.filter(value => value !== tag);
+  else state.excludeTags = state.excludeTags.filter(value => value !== tag);
+  renderActiveFilters();
+  renderTagCandidates(state.tagCandidates);
+  queueFilterReload();
+}
+
+function toggleTagMode(tag, mode) {
+  if (mode === "include") addTag(tag, "exclude");
+  else addTag(tag, "include");
+}
+
+function openTagResults() {
+  $("#tag-results").classList.remove("hidden");
+  $("#tag-search").setAttribute("aria-expanded", "true");
+}
+
+function closeTagResults() {
+  $("#tag-results").classList.add("hidden");
+  $("#tag-search").setAttribute("aria-expanded", "false");
+}
+
+function renderTagCandidates(tags) {
+  state.tagCandidates = tags || [];
+  const el = $("#tag-results");
+  if (!state.tagCandidates.length) {
+    el.innerHTML = '<p class="tag-empty muted">No matching tags.</p>';
+    return;
+  }
+  el.innerHTML = state.tagCandidates.map(item => {
+    const tag = item.name;
+    const included = state.includeTags.includes(tag);
+    const excluded = state.excludeTags.includes(tag);
+    const stateLabel = included ? "Included" : (excluded ? "Excluded" : "");
+    return `<button type="button" role="option" aria-selected="${included || excluded}"
+      class="tag-result ${included ? "included" : ""} ${excluded ? "excluded" : ""}"
+      data-tag="${esc(tag)}">
+      <span>${esc(tag)}</span><span class="tag-result-state">${stateLabel}</span>
+    </button>`;
+  }).join("");
+}
+
+async function loadTagCandidates() {
+  const generation = ++tagGeneration;
+  if (tagAbort) tagAbort.abort();
+  const controller = new AbortController();
+  tagAbort = controller;
+  const q = $("#tag-search").value.trim();
+  try {
+    const data = await api("/api/tags?limit=20&q=" + encodeURIComponent(q), { signal: controller.signal });
+    if (generation !== tagGeneration) return;
+    renderTagCandidates(data.tags || []);
+  } catch (err) {
+    if (err.name === "AbortError" || generation !== tagGeneration) return;
+    $("#tag-results").innerHTML = `<p class="tag-empty muted">${esc(err.message || "Could not load tags.")}</p>`;
+  }
+}
+
+async function fetchCollections(force = false) {
+  if (!force && state.collectionsLoaded) return state.collections;
+  const data = await api("/api/collections");
+  state.collections = data.collections || [];
+  state.collectionsLoaded = true;
+  renderCollectionOptions();
+  renderActiveFilters();
+  return state.collections;
+}
+
+function extractFilename(header, fallback) {
+  if (!header) return fallback;
+  const match = /filename\*=(?:UTF-8'')?([^;]+)|filename="([^"]+)"|filename=([^;]+)/i.exec(header);
+  const raw = match && (match[1] || match[2] || match[3]);
+  if (!raw) return fallback;
+  const trimmed = raw.trim().replace(/^"|"$/g, "");
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "download";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function downloadProtected(path, fallbackName) {
+  const res = await fetch(path, { headers: authHeaders() });
+  if (res.status === 401) {
+    logout();
+    throw new ApiError("Your session expired. Sign in again.", { status: 401 });
+  }
+  if (!res.ok) throw await responseError(res);
+  const blob = await res.blob();
+  const filename = extractFilename(res.headers.get("content-disposition"), fallbackName);
+  triggerBlobDownload(blob, filename);
+}
+
+// ---------- authentication ----------
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  $("#login-error").classList.add("hidden");
   try {
-    const r = await api("/api/auth/login", { json: { username: $("#login-user").value, password: $("#login-pass").value } });
-    state.token = r.token; localStorage.setItem("keepstack_token", r.token);
-    state.user = r.user; enterApp();
-  } catch { $("#login-error").textContent = "Invalid credentials"; $("#login-error").classList.remove("hidden"); }
+    const result = await api("/api/auth/login", {
+      json: { username: $("#login-user").value, password: $("#login-pass").value },
+    });
+    state.token = result.token;
+    localStorage.setItem("keepstack_token", result.token);
+    state.user = result.user;
+    enterApp();
+  } catch {
+    $("#login-error").textContent = "Invalid credentials";
+    $("#login-error").classList.remove("hidden");
+  }
 });
 $("#btn-logout").addEventListener("click", logout);
-function logout() { localStorage.removeItem("keepstack_token"); state.token = null; state.user = null;
-  $("#app").classList.add("hidden"); $("#login").classList.remove("hidden"); }
 
 function enterApp() {
-  $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
+  $("#login").classList.add("hidden");
+  $("#app").classList.remove("hidden");
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
-  loadLibrary();
+  setFilterControls();
+  renderActiveFilters();
+  syncUrl();
+  activateView("library");
+  fetchCollections(true).catch(err => toast(err.message || "Could not load collections.", "err"));
+  queueFilterReload();
 }
 
 // ---------- navigation ----------
-$$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
-  $$(".nav-item").forEach(b => b.classList.remove("active")); btn.classList.add("active");
-  const view = btn.dataset.view;
-  $$(".view").forEach(v => v.classList.add("hidden"));
-  $("#view-" + (view === "library" ? "library" : view)).classList.remove("hidden");
-  if (view === "library") loadLibrary();
-  if (view === "collections") loadCollections();
-  if (view === "dashboard") loadDashboard();
-  if (view === "users") loadUsers();
-  if (view === "audit") loadAudit();
+function activateView(view) {
+  $$(".nav-item").forEach(button => {
+    button.classList.toggle("active", button.dataset.view === view);
+  });
+  $$(".view").forEach(node => node.classList.add("hidden"));
+  const target = $("#view-" + view);
+  if (target) target.classList.remove("hidden");
+}
+
+$$(".nav-item").forEach(button => button.addEventListener("click", () => {
+  const view = button.dataset.view;
+  activateView(view);
+  if (view === "library") {
+    reloadCurrentPage();
+  } else if (view === "collections") {
+    loadCollections().catch(err => toast(err.message || "Could not load collections.", "err"));
+  } else if (view === "dashboard") {
+    loadDashboard().catch(err => toast(err.message || "Could not load dashboard.", "err"));
+  } else if (view === "users") {
+    loadUsers().catch(err => toast(err.message || "Could not load users.", "err"));
+  } else if (view === "audit") {
+    loadAudit().catch(err => toast(err.message || "Could not load audit log.", "err"));
+  }
 }));
 
-// ---------- library / search ----------
-let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
+// ---------- library filters ----------
+$("#search").addEventListener("input", (e) => {
+  state.q = e.target.value;
+  activateView("library");
+  syncUrl();
+  renderActiveFilters();
+  queueFilterReload({ delay: 250 });
+});
 
-async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
-  if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
-  if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
-  renderFacets(data.facets);
-  renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
-}
+$("#sort").addEventListener("change", (e) => {
+  state.sort = SORT_VALUES.includes(e.target.value) ? e.target.value : "newest";
+  queueFilterReload();
+});
 
-function renderGrid(items, total) {
-  $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
-  $("#empty").classList.toggle("hidden", items.length > 0);
-  $("#grid").innerHTML = items.map(a => `
-    <div class="card" data-uuid="${a.uuid}">
-      <img class="thumb" loading="lazy" src="/api/assets/${a.uuid}/thumb" alt="${esc(a.alt_text || a.title)}">
-      <div class="meta">
-        <span class="title" title="${esc(a.title)}">${esc(a.title)}</span>
-        <span class="sub"><span class="badge">${a.media_type}</span><span>${fmtBytes(a.size)}</span></span>
-      </div>
-    </div>`).join("");
-  $$("#grid .card").forEach(c => c.addEventListener("click", () => openAsset(c.dataset.uuid)));
-}
+$("#page-size").addEventListener("change", (e) => {
+  state.pageSize = parsePageSize(e.target.value);
+  localStorage.setItem(PAGE_SIZE_KEY, String(state.pageSize));
+  queueFilterReload();
+});
 
-function renderFacets(facets) {
-  $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
-    `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
-  $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
-    `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
-}
+$("#filter-media").addEventListener("change", (e) => {
+  state.media = e.target.value || null;
+  queueFilterReload();
+});
 
-// ---------- asset detail drawer ----------
+$("#filter-collection").addEventListener("change", (e) => {
+  state.collection = e.target.value || null;
+  queueFilterReload();
+});
+
+$("#btn-clear-filters").addEventListener("click", clearFilters);
+$("#btn-retry").addEventListener("click", reloadCurrentPage);
+$("#prev-page").addEventListener("click", previousPage);
+$("#next-page").addEventListener("click", nextPage);
+
+$("#active-filters").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const action = button.dataset.action;
+  if (action === "remove-keyword") {
+    state.q = "";
+    $("#search").value = "";
+    queueFilterReload();
+  } else if (action === "remove-media") {
+    state.media = null;
+    $("#filter-media").value = "";
+    queueFilterReload();
+  } else if (action === "remove-collection") {
+    state.collection = null;
+    $("#filter-collection").value = "";
+    queueFilterReload();
+  } else if (action === "toggle-tag") {
+    toggleTagMode(button.dataset.tag, button.dataset.mode);
+  } else if (action === "remove-tag") {
+    removeTag(button.dataset.tag, button.dataset.mode);
+  }
+});
+
+$("#grid").addEventListener("click", (event) => {
+  const card = event.target.closest(".card");
+  if (card && card.dataset.uuid) openAsset(card.dataset.uuid);
+});
+
+$("#tag-search").addEventListener("focus", () => {
+  openTagResults();
+  loadTagCandidates();
+});
+$("#tag-search").addEventListener("input", () => {
+  openTagResults();
+  clearTimeout(tagInputTimer);
+  tagInputTimer = setTimeout(loadTagCandidates, 150);
+});
+$("#tag-search").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeTagResults();
+  }
+});
+$("#tag-results").addEventListener("click", (event) => {
+  const button = event.target.closest(".tag-result");
+  if (!button) return;
+  const tag = button.dataset.tag;
+  if (state.includeTags.includes(tag)) {
+    removeTag(tag, "include");
+  } else if (state.excludeTags.includes(tag)) {
+    addTag(tag, "include");
+  } else {
+    addTag(tag, "include");
+  }
+  $("#tag-search").focus();
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".tag-picker")) closeTagResults();
+});
+
+// ---------- asset detail ----------
 const drawer = $("#drawer");
 $("#drawer-close").addEventListener("click", closeDrawer);
 $(".drawer-backdrop").addEventListener("click", closeDrawer);
-function closeDrawer() { drawer.classList.add("hidden"); document.body.classList.remove("modal-open"); }
+
+function closeDrawer() {
+  drawer.classList.add("hidden");
+  syncModalState();
+}
 
 async function openAsset(uuid) {
   drawer.classList.remove("hidden");
-  document.body.classList.add("modal-open");
+  syncModalState();
   $("#drawer-body").innerHTML = '<p class="muted">Loading...</p>';
-  const [d, meta, sim] = await Promise.all([
-    api("/api/assets/" + uuid),
-    api("/api/assets/" + uuid + "/metadata"),
-    api("/api/assets/" + uuid + "/similar"),
-  ]);
-  const a = d.asset;
-  const canEdit = ["admin","editor","contributor"].includes(state.user.role);
-  const preview = a.media_type === "image"
-    ? `<img class="detail-preview" src="/api/assets/${uuid}/preview" alt="${esc(a.alt_text||a.title)}">`
-    : `<img class="detail-preview" src="/api/assets/${uuid}/thumb" alt="${esc(a.title)}">`;
-  const dc = a.dublin_core || {};
-  $("#drawer-body").innerHTML = `
-    ${preview}
-    <h2 class="detail-title">${esc(a.title)}</h2>
-    <p class="muted">${a.media_type} &middot; ${a.ext?.toUpperCase()} &middot; ${fmtBytes(a.size)} ${a.width?`&middot; ${a.width}&times;${a.height}`:""}</p>
-    <div class="btn-row">
-      <a class="btn" href="/api/assets/${uuid}/file" download>Download</a>
-      ${canEdit?`<button class="btn" id="d-share">Create share link</button>`:""}
-      ${["admin","editor"].includes(state.user.role)?`<button class="btn btn-danger" id="d-delete">Delete</button>`:""}
-    </div>
-
-    ${canEdit ? `<div class="detail-section"><h4>Edit metadata</h4>
-      <div class="edit-grid">
-        <label>Title<input id="e-title" value="${esc(a.title)}"></label>
-        <label>Description<textarea id="e-description" rows="2">${esc(a.description)}</textarea></label>
-        <label>Alt text (accessibility)<input id="e-alt_text" value="${esc(a.alt_text)}"></label>
-        <label>Creator<input id="e-dc_creator" value="${esc(a.dc_creator)}"></label>
-        <label>Rights / license<input id="e-rights_statement" value="${esc(a.rights_statement)}"></label>
-        <label>Retention until<input id="e-retention_until" type="date" value="${esc((a.retention_until||'').slice(0,10))}"></label>
+  try {
+    const [detail, meta, similar] = await Promise.all([
+      api("/api/assets/" + encodeURIComponent(uuid)),
+      api("/api/assets/" + encodeURIComponent(uuid) + "/metadata"),
+      api("/api/assets/" + encodeURIComponent(uuid) + "/similar"),
+    ]);
+    const asset = detail.asset;
+    const canEdit = ["admin", "editor", "contributor"].includes(state.user.role);
+    const preview = asset.media_type === "image"
+      ? `<img class="detail-preview" src="/api/assets/${encodeURIComponent(uuid)}/preview" alt="${esc(asset.alt_text || asset.title || asset.filename)}">`
+      : `<img class="detail-preview" src="/api/assets/${encodeURIComponent(uuid)}/thumb" alt="${esc(asset.title || asset.filename)}">`;
+    const dc = asset.dublin_core || {};
+    $("#drawer-body").innerHTML = `
+      ${preview}
+      <h2 class="detail-title">${esc(asset.title || asset.filename)}</h2>
+      <p class="muted">${esc(asset.media_type)} &middot; ${esc((asset.ext || "").toUpperCase())} &middot; ${fmtBytes(asset.size)} ${asset.width ? `&middot; ${asset.width}&times;${asset.height}` : ""}</p>
+      <div class="btn-row">
+        <button class="btn" id="d-download" type="button">Download</button>
+        ${canEdit ? '<button class="btn" id="d-share" type="button">Create share link</button>' : ""}
+        ${["admin", "editor"].includes(state.user.role) ? '<button class="btn btn-danger" id="d-delete" type="button">Delete</button>' : ""}
       </div>
-      <div class="btn-row"><button class="btn btn-primary" id="d-save">Save changes</button></div></div>` : ""}
 
-    <div class="detail-section"><h4>Tags</h4>
-      <div class="tag-row" id="tag-row">
-        ${d.tags.map(t => `<span class="tag ${t.source==='ai'?'ai':''}">${esc(t.name)}${canEdit?`<span class="rm" data-tag="${esc(t.name)}">&times;</span>`:""}</span>`).join("")}
-        ${canEdit?`<input class="tag-add" id="tag-add" placeholder="+ add tag">`:""}
-      </div></div>
+      ${canEdit ? `<div class="detail-section"><h4>Edit metadata</h4>
+        <div class="edit-grid">
+          <label>Title<input id="e-title" value="${esc(asset.title)}"></label>
+          <label>Description<textarea id="e-description" rows="2">${esc(asset.description)}</textarea></label>
+          <label>Alt text (accessibility)<input id="e-alt_text" value="${esc(asset.alt_text)}"></label>
+          <label>Creator<input id="e-dc_creator" value="${esc(asset.dc_creator)}"></label>
+          <label>Rights / license<input id="e-rights_statement" value="${esc(asset.rights_statement)}"></label>
+          <label>Retention until<input id="e-retention_until" type="date" value="${esc((asset.retention_until || "").slice(0, 10))}"></label>
+        </div>
+        <div class="btn-row"><button class="btn btn-primary" id="d-save" type="button">Save changes</button></div></div>` : ""}
 
-    ${sim.items.length?`<div class="detail-section"><h4>Similar assets</h4>
-      <div class="similar-strip">${sim.items.slice(0,8).map(s=>`<img src="/api/assets/${s.uuid}/thumb" data-uuid="${s.uuid}" title="${esc(s.title)}">`).join("")}</div></div>`:""}
+      <div class="detail-section"><h4>Tags</h4>
+        <div class="tag-row" id="tag-row">
+          ${detail.tags.map(tag => `<span class="tag ${tag.source === "ai" ? "ai" : ""}">${esc(tag.name)}${canEdit ? `<span class="rm" data-tag="${esc(tag.name)}">&times;</span>` : ""}</span>`).join("")}
+          ${canEdit ? '<input class="tag-add" id="tag-add" placeholder="+ add tag">' : ""}
+        </div></div>
 
-    <div class="detail-section"><h4>Dublin Core</h4>
-      ${Object.entries(dc).filter(([,v])=>v).map(([k,v])=>`<div class="field-row"><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join("")}
-      <div class="btn-row"><a class="btn btn-ghost" href="/oai?verb=GetRecord&metadataPrefix=oai_dc&identifier=oai::${a.uuid}" target="_blank">View OAI-PMH XML</a></div>
-    </div>
+      ${similar.items.length ? `<div class="detail-section"><h4>Similar assets</h4>
+        <div class="similar-strip">${similar.items.slice(0, 8).map(item => `<img src="/api/assets/${esc(item.uuid)}/thumb" data-uuid="${esc(item.uuid)}" title="${esc(item.title || item.filename)}" alt="${esc(item.title || item.filename)}">`).join("")}</div></div>` : ""}
 
-    ${Object.keys(meta.exif||{}).length||Object.keys(meta.iptc||{}).length?`<div class="detail-section"><h4>Embedded metadata (EXIF / IPTC)</h4>
-      <div class="kv-scroll">${[...Object.entries(meta.iptc||{}),...Object.entries(meta.exif||{})].slice(0,40).map(([k,v])=>`<div class="field-row"><span class="k">${esc(k)}</span><span class="v">${esc(typeof v==='object'?JSON.stringify(v):v)}</span></div>`).join("")}</div></div>`:""}
+      <div class="detail-section"><h4>Dublin Core</h4>
+        ${Object.entries(dc).filter(([, value]) => value).map(([key, value]) => `<div class="field-row"><span class="k">${esc(key)}</span><span class="v">${esc(value)}</span></div>`).join("")}
+        <div class="btn-row"><a class="btn btn-ghost" href="/oai?verb=GetRecord&metadataPrefix=oai_dc&identifier=oai::${encodeURIComponent(asset.uuid)}" target="_blank" rel="noopener">View OAI-PMH XML</a></div>
+      </div>
 
-    ${d.versions.length?`<div class="detail-section"><h4>Versions</h4>${d.versions.map(v=>`<div class="field-row"><span class="k">v${v.version_no}</span><span class="v">${esc(v.note||'')} &middot; ${fmtBytes(v.size)} &middot; ${(v.created_at||'').slice(0,10)}</span></div>`).join("")}</div>`:""}
-  `;
+      ${Object.keys(meta.exif || {}).length || Object.keys(meta.iptc || {}).length ? `<div class="detail-section"><h4>Embedded metadata (EXIF / IPTC)</h4>
+        <div class="kv-scroll">${[...Object.entries(meta.iptc || {}), ...Object.entries(meta.exif || {})].slice(0, 40).map(([key, value]) => `<div class="field-row"><span class="k">${esc(key)}</span><span class="v">${esc(typeof value === "object" ? JSON.stringify(value) : value)}</span></div>`).join("")}</div></div>` : ""}
 
-  // wire detail actions
-  $$("#drawer-body .similar-strip img").forEach(img => img.addEventListener("click", () => openAsset(img.dataset.uuid)));
-  if (canEdit) {
-    $("#d-save")?.addEventListener("click", async () => {
-      const body = {};
-      ["title","description","alt_text","dc_creator","rights_statement","retention_until"].forEach(f => { const el = $("#e-"+f); if (el) body[f] = el.value; });
-      await api("/api/assets/"+uuid, { method: "PATCH", json: body });
-      toast("Saved"); openAsset(uuid); loadLibrary();
-    });
-    $("#tag-add")?.addEventListener("keydown", async (e) => {
-      if (e.key === "Enter" && e.target.value.trim()) {
-        await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
-        openAsset(uuid);
+      ${detail.versions.length ? `<div class="detail-section"><h4>Versions</h4>${detail.versions.map(version => `<div class="field-row"><span class="k">v${version.version_no}</span><span class="v">${esc(version.note || "")} &middot; ${fmtBytes(version.size)} &middot; ${esc((version.created_at || "").slice(0, 10))}</span></div>`).join("")}</div>` : ""}
+    `;
+
+    $$("#drawer-body .similar-strip img").forEach(img => img.addEventListener("click", () => openAsset(img.dataset.uuid)));
+    $("#d-download").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await downloadProtected("/api/assets/" + encodeURIComponent(uuid) + "/file", asset.filename || "asset");
+        toast("Download started");
+      } catch (err) {
+        toast(err.message || "Download failed.", "err");
+      } finally {
+        button.disabled = false;
       }
     });
-    $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
-      await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
-      openAsset(uuid);
-    }));
-    $("#d-share")?.addEventListener("click", async () => {
-      const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
-      await navigator.clipboard?.writeText(r.url).catch(()=>{});
-      toast("Share link copied: " + r.url);
+
+    if (canEdit) {
+      $("#d-save").addEventListener("click", async () => {
+        const body = {};
+        ["title", "description", "alt_text", "dc_creator", "rights_statement", "retention_until"].forEach(field => {
+          const input = $("#e-" + field);
+          if (input) body[field] = input.value;
+        });
+        try {
+          await api("/api/assets/" + encodeURIComponent(uuid), { method: "PATCH", json: body });
+          toast("Saved");
+          await openAsset(uuid);
+          reloadCurrentPage();
+        } catch (err) {
+          toast(err.message || "Save failed.", "err");
+        }
+      });
+      $("#tag-add").addEventListener("keydown", async (event) => {
+        if (event.key !== "Enter" || !event.target.value.trim()) return;
+        try {
+          await api("/api/assets/" + encodeURIComponent(uuid) + "/tags", { json: { name: event.target.value.trim() } });
+          await openAsset(uuid);
+          reloadCurrentPage();
+        } catch (err) {
+          toast(err.message || "Could not add tag.", "err");
+        }
+      });
+      $$("#tag-row .rm").forEach(remove => remove.addEventListener("click", async () => {
+        try {
+          await api("/api/assets/" + encodeURIComponent(uuid) + "/tags/" + encodeURIComponent(remove.dataset.tag), { method: "DELETE" });
+          await openAsset(uuid);
+          reloadCurrentPage();
+        } catch (err) {
+          toast(err.message || "Could not remove tag.", "err");
+        }
+      }));
+      $("#d-share").addEventListener("click", async () => {
+        try {
+          const result = await api("/api/shares", { json: { target_type: "asset", target_id: asset.id, permission: "download" } });
+          await navigator.clipboard?.writeText(result.url).catch(() => {});
+          toast("Share link copied: " + result.url);
+        } catch (err) {
+          toast(err.message || "Could not create share link.", "err");
+        }
+      });
+    }
+
+    $("#d-delete")?.addEventListener("click", async () => {
+      if (!confirm("Delete this asset?")) return;
+      try {
+        await api("/api/assets/" + encodeURIComponent(uuid), { method: "DELETE" });
+        toast("Deleted");
+        closeDrawer();
+        reloadCurrentPage();
+      } catch (err) {
+        toast(err.message || "Delete failed.", "err");
+      }
     });
+  } catch (err) {
+    $("#drawer-body").innerHTML = `<p class="error">${esc(err.message || "Could not load asset.")}</p>`;
   }
-  $("#d-delete")?.addEventListener("click", async () => {
-    if (!confirm("Delete this asset?")) return;
-    await api("/api/assets/"+uuid, { method: "DELETE" });
-    toast("Deleted"); closeDrawer(); loadLibrary();
-  });
 }
 
 // ---------- upload ----------
 const uploadModal = $("#upload-modal");
-$("#btn-upload").addEventListener("click", () => { uploadModal.classList.remove("hidden"); document.body.classList.add("modal-open"); });
-$("#upload-cancel").addEventListener("click", () => { uploadModal.classList.add("hidden"); document.body.classList.remove("modal-open"); loadLibrary(); });
-$(".modal-backdrop").addEventListener("click", () => { uploadModal.classList.add("hidden"); document.body.classList.remove("modal-open"); });
-const dz = $("#dropzone"), fileInput = $("#file-input");
-dz.addEventListener("click", () => fileInput.click());
-dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("drag"); });
-dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
-dz.addEventListener("drop", e => { e.preventDefault(); dz.classList.remove("drag"); uploadFiles(e.dataTransfer.files); });
+$("#btn-upload").addEventListener("click", () => {
+  uploadModal.classList.remove("hidden");
+  syncModalState();
+});
+$("#upload-cancel").addEventListener("click", () => {
+  uploadModal.classList.add("hidden");
+  syncModalState();
+  reloadCurrentPage();
+});
+$("#upload-modal .modal-backdrop").addEventListener("click", () => {
+  uploadModal.classList.add("hidden");
+  syncModalState();
+  reloadCurrentPage();
+});
+const dropzone = $("#dropzone");
+const fileInput = $("#file-input");
+dropzone.addEventListener("click", () => fileInput.click());
+dropzone.addEventListener("dragover", event => {
+  event.preventDefault();
+  dropzone.classList.add("drag");
+});
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+dropzone.addEventListener("drop", event => {
+  event.preventDefault();
+  dropzone.classList.remove("drag");
+  uploadFiles(event.dataTransfer.files);
+});
 fileInput.addEventListener("change", () => uploadFiles(fileInput.files));
 
 async function uploadFiles(files) {
   const list = $("#upload-list");
   for (const file of files) {
     const row = document.createElement("div");
-    row.className = "upload-item"; row.innerHTML = `<span>${esc(file.name)}</span><span>uploading...</span>`;
+    row.className = "upload-item";
+    row.innerHTML = `<span>${esc(file.name)}</span><span>uploading...</span>`;
     list.prepend(row);
-    const fd = new FormData(); fd.append("files", file); fd.append("run_ai", $("#ai-toggle").checked);
+    const formData = new FormData();
+    formData.append("files", file);
+    formData.append("run_ai", $("#ai-toggle").checked);
     try {
-      const r = await api("/api/assets", { method: "POST", body: fd });
-      const created = r.created[0];
+      const result = await api("/api/assets", { method: "POST", body: formData });
+      const created = result.created[0];
       row.classList.add(created.duplicate ? "dup" : "ok");
       row.lastChild.textContent = created.duplicate ? "duplicate (deduped)" : "done";
-    } catch (err) { row.classList.add("err"); row.lastChild.textContent = "failed"; }
+    } catch {
+      row.classList.add("err");
+      row.lastChild.textContent = "failed";
+    }
   }
 }
 
 // ---------- collections ----------
 async function loadCollections() {
-  const data = await api("/api/collections");
-  $("#collection-list").innerHTML = data.collections.map(c =>
-    `<div class="collection-card" data-id="${c.id}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
+  const data = await fetchCollections(true);
+  const list = $("#collection-list");
+  list.innerHTML = data.map(collection =>
+    `<div class="collection-card" data-id="${collection.id}"><span class="n">${esc(collection.name)}</span><span class="muted">${collection.asset_count} assets</span><span class="muted">${esc(collection.description || "")}</span></div>`).join("")
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
-    state.collection = card.dataset.id; state.media = null; state.tag = null;
-    $$(".nav-item").forEach(b => b.classList.remove("active"));
-    $('.nav-item[data-view="library"]').classList.add("active");
-    $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");
-    loadLibrary();
+    state.collection = String(card.dataset.id);
+    state.media = null;
+    state.includeTags = [];
+    state.excludeTags = [];
+    activateView("library");
+    setFilterControls();
+    renderActiveFilters();
+    queueFilterReload();
   }));
 }
+
 $("#btn-new-collection").addEventListener("click", async () => {
-  const name = prompt("Collection name"); if (!name) return;
-  await api("/api/collections", { json: { name } }); loadCollections();
+  const name = prompt("Collection name");
+  if (!name) return;
+  try {
+    await api("/api/collections", { json: { name } });
+    await loadCollections();
+  } catch (err) {
+    toast(err.message || "Could not create collection.", "err");
+  }
 });
 
 // ---------- dashboard ----------
 async function loadDashboard() {
-  const s = await api("/api/stats");
+  const stats = await api("/api/stats");
   const cards = [
-    ["Total assets", s.total_assets], ["Storage used", fmtBytes(s.total_bytes)],
-    ["Saved by dedup", fmtBytes(s.dedup_saved_bytes)], ["Tags", s.tags], ["Collections", s.collections],
-    ...Object.entries(s.by_type).map(([k,v]) => [k.charAt(0).toUpperCase()+k.slice(1), v]),
+    ["Total assets", stats.total_assets],
+    ["Storage used", fmtBytes(stats.total_bytes)],
+    ["Saved by dedup", fmtBytes(stats.dedup_saved_bytes)],
+    ["Tags", stats.tags],
+    ["Collections", stats.collections],
+    ...Object.entries(stats.by_type).map(([key, value]) => [key.charAt(0).toUpperCase() + key.slice(1), value]),
   ];
-  $("#stat-cards").innerHTML = cards.map(([l,n]) => `<div class="stat-card"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
+  $("#stat-cards").innerHTML = cards.map(([label, value]) => `<div class="stat-card"><div class="n">${value}</div><div class="l">${label}</div></div>`).join("");
 }
 $("#btn-fixity").addEventListener("click", async () => {
   $("#fixity-result").textContent = "Checking...";
-  const r = await api("/api/admin/fixity", { method: "POST" });
-  $("#fixity-result").textContent = r.ok ? `All ${r.checked} blobs verified. Integrity intact.` : `${r.failures.length} of ${r.checked} failed fixity.`;
+  try {
+    const result = await api("/api/admin/fixity", { method: "POST" });
+    $("#fixity-result").textContent = result.ok
+      ? `All ${result.checked} blobs verified. Integrity intact.`
+      : `${result.failures.length} of ${result.checked} failed fixity.`;
+  } catch (err) {
+    $("#fixity-result").textContent = err.message || "Fixity check failed.";
+  }
 });
 
 // ---------- users ----------
 async function loadUsers() {
   const data = await api("/api/users");
-  $("#user-rows").innerHTML = data.users.map(u =>
-    `<tr><td>${esc(u.username)}</td><td>${esc(u.email||"")}</td><td>${u.role}</td><td>${u.is_active?"Yes":"No"}</td><td>${(u.last_login||"").slice(0,16).replace("T"," ")}</td></tr>`).join("");
+  $("#user-rows").innerHTML = data.users.map(user =>
+    `<tr><td>${esc(user.username)}</td><td>${esc(user.email || "")}</td><td>${esc(user.role)}</td><td>${user.is_active ? "Yes" : "No"}</td><td>${esc((user.last_login || "").slice(0, 16).replace("T", " "))}</td></tr>`).join("");
 }
 $("#btn-new-user").addEventListener("click", async () => {
-  const username = prompt("Username"); if (!username) return;
-  const password = prompt("Temporary password"); if (!password) return;
+  const username = prompt("Username");
+  if (!username) return;
+  const password = prompt("Temporary password");
+  if (!password) return;
   const role = prompt("Role (admin/editor/contributor/viewer)", "contributor") || "viewer";
-  await api("/api/users", { json: { username, password, role } }); loadUsers();
+  try {
+    await api("/api/users", { json: { username, password, role } });
+    await loadUsers();
+  } catch (err) {
+    toast(err.message || "Could not create user.", "err");
+  }
 });
 
 // ---------- audit ----------
 async function loadAudit() {
   const data = await api("/api/audit");
-  $("#audit-rows").innerHTML = data.entries.map(e =>
-    `<tr><td>${(e.ts||"").slice(0,19).replace("T"," ")}</td><td>${esc(e.username||"-")}</td><td>${esc(e.action)}</td>
-     <td>${esc(e.target_type||"")} ${esc((e.target_id||"").slice(0,8))}</td><td>${esc(e.detail||"")}</td><td>${esc(e.ip||"")}</td></tr>`).join("");
+  $("#audit-rows").innerHTML = data.entries.map(entry =>
+    `<tr><td>${esc((entry.ts || "").slice(0, 19).replace("T", " "))}</td><td>${esc(entry.username || "-")}</td><td>${esc(entry.action)}</td>
+     <td>${esc(entry.target_type || "")} ${esc((entry.target_id || "").slice(0, 8))}</td><td>${esc(entry.detail || "")}</td><td>${esc(entry.ip || "")}</td></tr>`).join("");
 }
 
-// ---------- boot ----------
+// ---------- CSV export ----------
+function exportFilterSummary() {
+  const parts = [];
+  if (state.q.trim()) parts.push(["Keyword", state.q.trim()]);
+  if (state.media) parts.push(["Media", state.media]);
+  if (state.collection) parts.push(["Collection", collectionName(state.collection)]);
+  if (state.includeTags.length) parts.push(["Include", state.includeTags.join(", ")]);
+  if (state.excludeTags.length) parts.push(["Exclude", state.excludeTags.join(", ")]);
+  parts.push(["Sort", SORT_LABELS[state.sort] || state.sort]);
+  return parts;
+}
+
+function renderExportColumns() {
+  $("#export-required").innerHTML = REQUIRED_EXPORT_COLUMNS.map(([key, label]) =>
+    `<label class="check column-option locked"><input type="checkbox" checked disabled> ${esc(label)} <span class="muted">(${esc(key)})</span></label>`).join("");
+  $("#export-optional").innerHTML = OPTIONAL_EXPORT_COLUMNS.map(([key, label]) =>
+    `<label class="check column-option"><input type="checkbox" data-export-column="${key}" ${state.exportOptional.has(key) ? "checked" : ""}> ${esc(label)}</label>`).join("");
+}
+
+function saveExportPreferences() {
+  localStorage.setItem(EXPORT_PREFS_KEY, JSON.stringify([...state.exportOptional].sort()));
+}
+
+function openExportModal() {
+  if (state.loading) return;
+  if (!state.libraryOK) {
+    toast("Load the current asset list before exporting.", "err");
+    return;
+  }
+  state.exportLastFocus = document.activeElement;
+  $("#export-count").textContent = state.total === 0
+    ? "No matching assets. A header-only CSV will be downloaded."
+    : `${state.total} matching asset${state.total === 1 ? "" : "s"} will be exported.`;
+  $("#export-filters").innerHTML = exportFilterSummary().map(([label, value]) =>
+    `<span class="export-filter"><span class="filter-label">${esc(label)}</span> ${esc(value)}</span>`).join("");
+  renderExportColumns();
+  $("#export-sanitize").checked = true;
+  $("#export-error").classList.add("hidden");
+  $("#export-error").textContent = "";
+  $("#export-modal").classList.remove("hidden");
+  syncModalState();
+  $("#export-close").focus();
+}
+
+function closeExportModal() {
+  const modal = $("#export-modal");
+  if (modal.classList.contains("hidden")) return;
+  modal.classList.add("hidden");
+  syncModalState();
+  if (state.exportLastFocus && typeof state.exportLastFocus.focus === "function") {
+    state.exportLastFocus.focus();
+  }
+}
+
+function buildExportParams() {
+  const params = new URLSearchParams();
+  if (state.q) params.set("q", state.q);
+  if (state.media) params.set("media_type", state.media);
+  if (state.collection) params.set("collection_id", state.collection);
+  state.includeTags.forEach(tag => params.append("tags", tag));
+  state.excludeTags.forEach(tag => params.append("exclude_tags", tag));
+  params.set("sort", state.sort);
+  [...state.exportOptional].sort().forEach(column => params.append("columns", column));
+  params.set("sanitize_formulas", $("#export-sanitize").checked ? "true" : "false");
+  return params;
+}
+
+$("#btn-export").addEventListener("click", openExportModal);
+$("#export-close").addEventListener("click", closeExportModal);
+$("#export-cancel").addEventListener("click", closeExportModal);
+$("#export-modal .modal-backdrop").addEventListener("click", closeExportModal);
+$("#export-optional").addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-export-column]");
+  if (!input) return;
+  if (input.checked) state.exportOptional.add(input.dataset.exportColumn);
+  else state.exportOptional.delete(input.dataset.exportColumn);
+  saveExportPreferences();
+});
+$("#export-reset-columns").addEventListener("click", () => {
+  state.exportOptional = new Set();
+  saveExportPreferences();
+  renderExportColumns();
+});
+$("#export-download").addEventListener("click", async () => {
+  const button = $("#export-download");
+  const error = $("#export-error");
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "Exporting...";
+  error.classList.add("hidden");
+  try {
+    const params = buildExportParams();
+    await downloadProtected("/api/exports/assets.csv?" + params.toString(), "assets.csv");
+    toast("CSV download started");
+  } catch (err) {
+    let message = err.message || "Export failed.";
+    if (err instanceof ApiError && err.code === "export_too_large" && err.detail) {
+      message = `Matched ${err.detail.matched} assets, above the ${err.detail.limit}-row limit. Narrow the filters and try again.`;
+    }
+    if (err instanceof ApiError && err.status === 401) {
+      message = "Your session expired. Sign in again.";
+    }
+    error.textContent = message;
+    error.classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
+
+// ---------- global keyboard and boot ----------
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!$("#export-modal").classList.contains("hidden")) {
+    closeExportModal();
+  } else if (!uploadModal.classList.contains("hidden")) {
+    uploadModal.classList.add("hidden");
+    syncModalState();
+    reloadCurrentPage();
+  } else if (!drawer.classList.contains("hidden")) {
+    closeDrawer();
+  } else {
+    closeTagResults();
+  }
+});
+
 (async function boot() {
+  setFilterControls();
+  renderActiveFilters();
   if (state.token) {
-    try { state.user = await api("/api/auth/me"); enterApp(); return; } catch {}
+    try {
+      state.user = await api("/api/auth/me");
+      enterApp();
+      return;
+    } catch {
+      /* fall through to the login form */
+    }
   }
   $("#login").classList.remove("hidden");
 })();
