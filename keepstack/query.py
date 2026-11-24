@@ -79,8 +79,12 @@ def build_base(spec: FilterSpec) -> BaseQuery:
     params: list = [spec.status]
 
     if spec.search_terms:
-        joins.append("JOIN asset_fts f ON f.rowid = a.id")
-        where.append("asset_fts MATCH ?")
+        # Keep FTS as a subquery. A plain JOIN lets SQLite scan the status
+        # index first and probe the virtual table per row, which is orders of
+        # magnitude slower on large catalogs.
+        where.append(
+            "a.id IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?)"
+        )
         params.append(fts_query(spec.search_terms))
 
     if spec.media_type:

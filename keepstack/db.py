@@ -198,7 +198,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS asset_fts USING fts5(
 # Schema changes after the original v0 schema live here. Each entry is applied
 # once, in order, and recorded in schema_meta. Keep migrations additive and
 # idempotent: existing installations must upgrade without losing data.
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -216,6 +216,63 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         # second. The primary key has the opposite order.
         "CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_asset "
         "ON asset_tags (tag_id, asset_id)",
+    ),
+    2: (
+        # Covers the global media-type facet and media-filtered list queries
+        # without table lookups for every active row.
+        "CREATE INDEX IF NOT EXISTS idx_assets_status_media "
+        "ON assets (status, media_type)",
+        # Materialized active-tag counts keep the global tag facet cheap on
+        # large catalogs. Triggers below maintain them transactionally.
+        """CREATE TABLE IF NOT EXISTS tag_usage (
+            tag_id       INTEGER PRIMARY KEY,
+            active_count INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE
+        )""",
+        """INSERT INTO tag_usage (tag_id, active_count)
+           SELECT t.id, COUNT(a.id)
+           FROM tags t
+           LEFT JOIN asset_tags at ON at.tag_id = t.id
+           LEFT JOIN assets a ON a.id = at.asset_id AND a.status = 'active'
+           GROUP BY t.id""",
+        """CREATE TRIGGER IF NOT EXISTS trg_asset_tags_active_insert
+           AFTER INSERT ON asset_tags
+           WHEN EXISTS (SELECT 1 FROM assets WHERE id = NEW.asset_id AND status = 'active')
+           BEGIN
+               INSERT INTO tag_usage (tag_id, active_count) VALUES (NEW.tag_id, 1)
+               ON CONFLICT(tag_id) DO UPDATE SET active_count = active_count + 1;
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_asset_tags_active_delete
+           AFTER DELETE ON asset_tags
+           WHEN EXISTS (SELECT 1 FROM assets WHERE id = OLD.asset_id AND status = 'active')
+           BEGIN
+               UPDATE tag_usage SET active_count = MAX(0, active_count - 1)
+               WHERE tag_id = OLD.tag_id;
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_assets_activate_tags
+           AFTER UPDATE OF status ON assets
+           WHEN OLD.status <> 'active' AND NEW.status = 'active'
+           BEGIN
+               INSERT INTO tag_usage (tag_id, active_count)
+               SELECT tag_id, 1 FROM asset_tags WHERE asset_id = NEW.id
+               ON CONFLICT(tag_id) DO UPDATE SET active_count = active_count + 1;
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_assets_deactivate_tags
+           AFTER UPDATE OF status ON assets
+           WHEN OLD.status = 'active' AND NEW.status <> 'active'
+           BEGIN
+               UPDATE tag_usage
+               SET active_count = MAX(0, active_count - 1)
+               WHERE tag_id IN (SELECT tag_id FROM asset_tags WHERE asset_id = NEW.id);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_assets_hard_delete_tags
+           BEFORE DELETE ON assets
+           WHEN OLD.status = 'active'
+           BEGIN
+               UPDATE tag_usage
+               SET active_count = MAX(0, active_count - 1)
+               WHERE tag_id IN (SELECT tag_id FROM asset_tags WHERE asset_id = OLD.id);
+           END""",
     ),
 }
 

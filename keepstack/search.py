@@ -190,13 +190,21 @@ def _facets(status: str, conn=None) -> dict:
         "SELECT media_type, COUNT(*) c FROM assets WHERE status = ? GROUP BY media_type ORDER BY c DESC",
         (status,),
     ).fetchall()
-    tags = conn.execute(
-        """SELECT t.name, COUNT(*) c FROM tags t
-           JOIN asset_tags at ON at.tag_id = t.id
-           JOIN assets a ON a.id = at.asset_id AND a.status = ?
-           GROUP BY t.name ORDER BY c DESC LIMIT 25""",
-        (status,),
-    ).fetchall()
+    if status == "active":
+        tags = conn.execute(
+            """SELECT t.name, tu.active_count c
+               FROM tag_usage tu JOIN tags t ON t.id = tu.tag_id
+               WHERE tu.active_count > 0
+               ORDER BY tu.active_count DESC, t.name LIMIT 25"""
+        ).fetchall()
+    else:
+        tags = conn.execute(
+            """SELECT t.name, COUNT(*) c FROM tags t
+               JOIN asset_tags at ON at.tag_id = t.id
+               JOIN assets a ON a.id = at.asset_id AND a.status = ?
+               GROUP BY t.name ORDER BY c DESC LIMIT 25""",
+            (status,),
+        ).fetchall()
     return {
         "media_types": [{"value": r["media_type"], "count": r["c"]} for r in media],
         "tags": [{"value": r["name"], "count": r["c"]} for r in tags],

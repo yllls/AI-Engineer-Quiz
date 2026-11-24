@@ -42,8 +42,17 @@ def test_v0_database_upgrades_without_losing_data():
     assert "idx_assets_status_created_id" in indexes
     assert "idx_assets_status_name_id" in indexes
     assert "idx_assets_status_size_id" in indexes
+    assert "idx_assets_status_media" in indexes
     tag_indexes = {r[1] for r in conn.execute("PRAGMA index_list('asset_tags')")}
     assert "idx_asset_tags_tag_asset" in tag_indexes
+
+    usage = conn.execute("SELECT active_count FROM tag_usage WHERE tag_id = 1").fetchone()
+    assert usage == (1,)
+    triggers = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+    assert "trg_asset_tags_active_insert" in triggers
+    assert "trg_assets_deactivate_tags" in triggers
 
 
 def test_migrations_are_idempotent():
@@ -52,6 +61,38 @@ def test_migrations_are_idempotent():
     apply_migrations(conn)
     assert schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
+
+
+def test_tag_usage_follows_status_tag_and_delete_changes():
+    conn = _v0_database()
+    apply_migrations(conn)
+
+    def count():
+        return conn.execute(
+            "SELECT active_count FROM tag_usage WHERE tag_id = 1"
+        ).fetchone()[0]
+
+    assert count() == 1
+
+    conn.execute("UPDATE assets SET status = 'deleted' WHERE id = 1")
+    conn.commit()
+    assert count() == 0
+
+    conn.execute("UPDATE assets SET status = 'active' WHERE id = 1")
+    conn.commit()
+    assert count() == 1
+
+    conn.execute("DELETE FROM asset_tags WHERE asset_id = 1 AND tag_id = 1")
+    conn.commit()
+    assert count() == 0
+
+    conn.execute("INSERT INTO asset_tags (asset_id, tag_id, source) VALUES (1, 1, 'manual')")
+    conn.commit()
+    assert count() == 1
+
+    conn.execute("DELETE FROM assets WHERE id = 1")
+    conn.commit()
+    assert count() == 0
 
 
 def test_newer_schema_is_rejected():
