@@ -15,8 +15,9 @@ from typing import Literal, Optional
 from fastapi import (Body, Depends, FastAPI, File, Form, HTTPException, Query,
                      Request, UploadFile)
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, Response)
+                               PlainTextResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from . import __version__, ingest, search, standards, storage, thumbnails
 from .audit import log, now_iso
@@ -25,9 +26,11 @@ from .auth import (authenticate, hash_password, login_locked, make_token,
                    verify_password, verify_token)
 from .config import config
 from .db import get_conn, init_db, transaction
-from .filters import MAX_QUERY_LENGTH, FilterValidationError
+from .exports import (CsvExporter, ExportTooLargeError, ExportValidationError,
+                      export_filename, resolve_columns)
+from .filters import (MAX_QUERY_LENGTH, FilterSpec, FilterValidationError)
 from .pagination import InvalidCursorError
-from .query import QueryError
+from .query import QueryError, resolve_sort
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -465,6 +468,102 @@ def list_tags(
         query_params.extend([limit, offset])
     rows = conn.execute(sql, query_params).fetchall()
     return {"tags": [dict(r) for r in rows], "total": total}
+
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+@app.get("/api/exports/assets.csv")
+def export_assets_csv(
+    request: Request,
+    q: str = "",
+    media_type: Optional[str] = None,
+    tag: Optional[str] = None,
+    tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
+    collection_id: Optional[int] = Query(None, ge=1),
+    status: str = "active",
+    sort: Literal["newest", "oldest", "name", "largest"] = "newest",
+    columns: list[str] = Query(default=[]),
+    sanitize_formulas: bool = True,
+    user: dict = Depends(require_user),
+):
+    normalized_status = (status or "active").strip().lower() or "active"
+    if normalized_status != "active":
+        raise HTTPException(
+            400,
+            detail={
+                "code": "active_only",
+                "message": "CSV export is limited to active assets",
+            },
+        )
+    try:
+        spec = FilterSpec.build(
+            q=q,
+            media_type=media_type,
+            collection_id=collection_id,
+            tag=tag,
+            tags=tags,
+            exclude_tags=exclude_tags,
+            status="active",
+        )
+        sort_spec = resolve_sort(sort)
+        selected_columns = resolve_columns(columns)
+    except (FilterValidationError, ExportValidationError, QueryError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    exporter = CsvExporter(
+        spec=spec,
+        sort=sort_spec,
+        columns=selected_columns,
+        sanitize_formulas=sanitize_formulas,
+    )
+    try:
+        exporter.open()
+    except ExportTooLargeError as exc:
+        raise HTTPException(
+            413,
+            detail={
+                "code": "export_too_large",
+                "matched": exc.matched,
+                "limit": exc.limit,
+                "message": str(exc),
+            },
+        ) from exc
+
+    try:
+        log(
+            "asset.export",
+            user=user,
+            target_type="export",
+            detail=json.dumps(
+                {
+                    "matched": exporter.total,
+                    "sort": sort_spec.name,
+                    "columns": list(selected_columns),
+                    "sanitize_formulas": sanitize_formulas,
+                    **spec.summary(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            ip=client_ip(request),
+        )
+    except Exception:
+        exporter.close()
+        raise
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{export_filename()}"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    return StreamingResponse(
+        exporter.iter_chunks(),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+        background=BackgroundTask(exporter.close),
+    )
 
 
 # ---------------------------------------------------------------------------

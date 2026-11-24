@@ -45,6 +45,13 @@ class Config:
         # Uploads
         self.max_upload_mb = int(os.environ.get("KEEPSTACK_MAX_UPLOAD_MB", "1024"))
 
+        # CSV export is deliberately synchronous and bounded. Operators can
+        # raise this for larger installations, but a request above the limit is
+        # rejected before any bytes are streamed.
+        self.export_max_rows = int(os.environ.get("KEEPSTACK_EXPORT_MAX_ROWS", "100000"))
+        if self.export_max_rows < 1:
+            raise ValueError("KEEPSTACK_EXPORT_MAX_ROWS must be a positive integer")
+
         # Optional OCR via the Tesseract binary (used only when installed).
         self.ocr_enabled = _env_bool("KEEPSTACK_OCR_ENABLED", True)
 
