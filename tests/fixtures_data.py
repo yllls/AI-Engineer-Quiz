@@ -142,6 +142,15 @@ def seed_e2e_catalog() -> None:
             created_at=f"2025-12-0{index + 1}T00:00:00+00:00",
         )
 
+    # Enough unused tags to exercise the tag picker's server-side pagination.
+    conn = get_conn()
+    for index in range(25):
+        conn.execute(
+            "INSERT OR IGNORE INTO tags (name) VALUES (?)",
+            (f"bulk-tag-{index:02d}",),
+        )
+    conn.commit()
+
 
 if __name__ == "__main__":
     seed_e2e_catalog()

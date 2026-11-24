@@ -46,6 +46,17 @@ def test_library_loads_with_keyword_only_interface(logged_in_page):
     expect(page.locator("#page-label")).to_have_text("Page 1")
 
 
+def test_tag_candidates_load_more(logged_in_page):
+    page = logged_in_page
+    page.click("#tag-search")
+    expect(page.locator("#tag-results .tag-result")).to_have_count(20)
+    more = page.locator("#tag-results .tag-more")
+    expect(more).to_be_visible()
+    more.click()
+    expect(page.locator("#tag-results .tag-result")).to_have_count(29)
+    expect(page.locator("#tag-results .tag-more")).to_have_count(0)
+
+
 def test_combined_filters_active_chips_and_clear(logged_in_page):
     page = logged_in_page
     page.fill("#search", "harbor")

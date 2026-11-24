@@ -108,6 +108,7 @@ const state = {
   collections: [],
   collectionsLoaded: false,
   tagCandidates: [],
+  tagTotal: 0,
   exportOptional: loadExportPreferences(),
   exportLastFocus: null,
 };
@@ -562,7 +563,7 @@ function addTag(raw, mode = "include") {
     state.excludeTags.sort();
   }
   renderActiveFilters();
-  renderTagCandidates(state.tagCandidates);
+  renderTagCandidates();
   queueFilterReload();
 }
 
@@ -570,7 +571,7 @@ function removeTag(tag, mode) {
   if (mode === "include") state.includeTags = state.includeTags.filter(value => value !== tag);
   else state.excludeTags = state.excludeTags.filter(value => value !== tag);
   renderActiveFilters();
-  renderTagCandidates(state.tagCandidates);
+  renderTagCandidates();
   queueFilterReload();
 }
 
@@ -589,14 +590,13 @@ function closeTagResults() {
   $("#tag-search").setAttribute("aria-expanded", "false");
 }
 
-function renderTagCandidates(tags) {
-  state.tagCandidates = tags || [];
+function renderTagCandidates() {
   const el = $("#tag-results");
   if (!state.tagCandidates.length) {
     el.innerHTML = '<p class="tag-empty muted">No matching tags.</p>';
     return;
   }
-  el.innerHTML = state.tagCandidates.map(item => {
+  const rows = state.tagCandidates.map(item => {
     const tag = item.name;
     const included = state.includeTags.includes(tag);
     const excluded = state.excludeTags.includes(tag);
@@ -606,19 +606,30 @@ function renderTagCandidates(tags) {
       data-tag="${esc(tag)}">
       <span>${esc(tag)}</span><span class="tag-result-state">${stateLabel}</span>
     </button>`;
-  }).join("");
+  });
+  if (state.tagCandidates.length < state.tagTotal) {
+    rows.push('<button type="button" class="tag-more">Load more</button>');
+  }
+  el.innerHTML = rows.join("");
 }
 
-async function loadTagCandidates() {
+async function loadTagCandidates(append = false) {
   const generation = ++tagGeneration;
   if (tagAbort) tagAbort.abort();
   const controller = new AbortController();
   tagAbort = controller;
   const q = $("#tag-search").value.trim();
+  const offset = append ? state.tagCandidates.length : 0;
   try {
-    const data = await api("/api/tags?limit=20&q=" + encodeURIComponent(q), { signal: controller.signal });
+    const data = await api(
+      `/api/tags?limit=20&offset=${offset}&q=${encodeURIComponent(q)}`,
+      { signal: controller.signal }
+    );
     if (generation !== tagGeneration) return;
-    renderTagCandidates(data.tags || []);
+    const incoming = data.tags || [];
+    state.tagCandidates = append ? state.tagCandidates.concat(incoming) : incoming;
+    state.tagTotal = Number(data.total) || state.tagCandidates.length;
+    renderTagCandidates();
   } catch (err) {
     if (err.name === "AbortError" || generation !== tagGeneration) return;
     $("#tag-results").innerHTML = `<p class="tag-empty muted">${esc(err.message || "Could not load tags.")}</p>`;
@@ -808,13 +819,15 @@ $("#tag-search").addEventListener("keydown", (event) => {
   }
 });
 $("#tag-results").addEventListener("click", (event) => {
+  if (event.target.closest(".tag-more")) {
+    loadTagCandidates(true);
+    return;
+  }
   const button = event.target.closest(".tag-result");
   if (!button) return;
   const tag = button.dataset.tag;
   if (state.includeTags.includes(tag)) {
     removeTag(tag, "include");
-  } else if (state.excludeTags.includes(tag)) {
-    addTag(tag, "include");
   } else {
     addTag(tag, "include");
   }

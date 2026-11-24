@@ -163,6 +163,11 @@ button, input, select { font-family: inherit; font-size: inherit; }
 .tag-result.excluded { color: var(--danger); }
 .tag-result-state { color: var(--muted); font-size: 12px; }
 .tag-empty { margin: 0; padding: var(--s2); font-size: 13px; }
+.tag-more {
+  width: 100%; border: 0; border-top: 1px solid var(--base-3); background: transparent;
+  color: var(--accent); text-align: center; padding: var(--s1); cursor: pointer; font-size: 12px;
+}
+.tag-more:hover { background: var(--base-2); }
 .clear-filters { margin-left: auto; }
 .active-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .filter-chip {
