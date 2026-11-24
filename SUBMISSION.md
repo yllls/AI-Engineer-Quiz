@@ -26,7 +26,7 @@
 请求示例：
 
 ```http
-GET /api/assets?q=harbor&collection_id=1&tags=approved&tags=campaign&exclude_tags=internal&sort=oldest&limit=24
+GET /api/assets?q=harbor&collection_id=1&tags=approved&tags=campaign&exclude_tags=internal&sort=oldest&limit=10
 ```
 
 媒体类型保持单选。旧版单个 `tag` 参数仍作为包含标签兼容别名。
@@ -40,7 +40,8 @@ GET /api/assets?q=harbor&collection_id=1&tags=approved&tags=campaign&exclude_tag
 - 响应保留 `total`、`items`、`facets`、`mode`，新增嵌套 `pagination`
 - 保留旧 `limit` 和 `offset` 模式，游标与 offset 互斥
 - 页面支持上一页、下一页、当前页和匹配总数，不提供任意页码跳转
-- 服务器默认每页 60 条、上限 200 条；新界面默认 24 条，可选 24、48、96 条并保存在浏览器
+- 服务器默认每页 60 条、上限 200 条；新界面默认 10 条，可选 10、20、50 条并保存在浏览器
+- 桌面端使用五列网格，默认 10 条正好两整行；窄屏按响应式断点减少列数
 
 分页响应示例：
 
@@ -50,7 +51,7 @@ GET /api/assets?q=harbor&collection_id=1&tags=approved&tags=campaign&exclude_tag
   "items": [],
   "pagination": {
     "page": 2,
-    "limit": 24,
+    "limit": 10,
     "prev_cursor": "...",
     "next_cursor": "..."
   }
@@ -161,13 +162,13 @@ KEEPSTACK_E2E=1 python -m pytest -q tests/e2e
 python scripts/benchmark.py --rows 100000 --iterations 20
 ```
 
-本次实测环境：Windows 11，Python 3.10.14，SQLite 3.45.3，单机临时目录。
+本次实测环境：Windows 11，Python 3.10.14，SQLite 3.45.3，单机临时目录。列表场景使用界面默认每页 10 条。
 
 | 场景 | 结果 |
 |---|---|
-| 10 万素材，关键词搜索首屏 P50 / P95 | 222.61ms / 235.01ms |
-| 10 万素材，组合筛选首屏 P50 / P95 | 437.75ms / 452.05ms |
-| 10 万行全量 CSV 导出 | 2.82s，约 16.3MB，约 35,500 行/秒 |
+| 10 万素材，关键词搜索首屏 P50 / P95 | 211.54ms / 220.07ms |
+| 10 万素材，组合筛选首屏 P50 / P95 | 411.40ms / 454.32ms |
+| 10 万行全量 CSV 导出 | 2.81s，约 16.3MB，约 35,600 行/秒 |
 
 该基准不放入常规 CI。它使用直接查询与导出路径测量后端成本，不包含浏览器渲染、网络传输或缩略图下载。
 

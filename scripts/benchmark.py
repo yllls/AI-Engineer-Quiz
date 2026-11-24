@@ -153,7 +153,7 @@ def _bench_list(iterations: int, collection_id: int) -> list[dict]:
     scenarios = [
         (
             "keyword",
-            dict(q="harbor", sort="newest", limit=24),
+            dict(q="harbor", sort="newest", limit=10),
         ),
         (
             "combined",
@@ -163,7 +163,7 @@ def _bench_list(iterations: int, collection_id: int) -> list[dict]:
                 tags=["approved", "campaign"],
                 exclude_tags=["internal"],
                 sort="newest",
-                limit=24,
+                limit=10,
             ),
         ),
     ]
