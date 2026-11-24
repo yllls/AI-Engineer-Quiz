@@ -10,7 +10,7 @@ import io
 import ipaddress
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import (Body, Depends, FastAPI, File, Form, HTTPException, Query,
                      Request, UploadFile)
@@ -25,6 +25,9 @@ from .auth import (authenticate, hash_password, login_locked, make_token,
                    verify_password, verify_token)
 from .config import config
 from .db import get_conn, init_db, transaction
+from .filters import MAX_QUERY_LENGTH, FilterValidationError
+from .pagination import InvalidCursorError
+from .query import QueryError
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -178,16 +181,81 @@ def list_assets(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
-    collection_id: Optional[int] = None,
+    tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
+    collection_id: Optional[int] = Query(None, ge=1),
     status: str = "active",
-    sort: str = "newest",
-    mode: str = "keyword",
-    limit: int = Query(60, le=200),
-    offset: int = 0,
+    sort: Literal["newest", "oldest", "name", "largest"] = "newest",
+    mode: Literal["keyword", "semantic"] = "keyword",
+    limit: int = Query(60, ge=1, le=200),
+    offset: Optional[int] = Query(None, ge=0),
+    cursor: Optional[str] = None,
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    normalized_status = (status or "active").strip().lower() or "active"
+    uses_new_filters = bool(tags or exclude_tags) or cursor is not None
+    if cursor is not None and offset is not None:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_pagination",
+                "message": "Use either cursor or offset, not both",
+            },
+        )
+    if mode == "semantic" and (tags or exclude_tags or cursor is not None):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "unsupported_semantic_filters",
+                "message": "Semantic search does not support tag filters or cursors",
+            },
+        )
+    if normalized_status != "active":
+        if uses_new_filters:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "active_only",
+                    "message": "Combined filters, cursor pagination and export require active assets",
+                },
+            )
+        # Preserve the pre-keyset API's status queries by keeping them on the
+        # legacy offset path even when the old client omitted offset.
+        if offset is None:
+            offset = 0
+
+    try:
+        return search.search(
+            q=q,
+            media_type=media_type,
+            tag=tag,
+            tags=tags,
+            exclude_tags=exclude_tags,
+            collection_id=collection_id,
+            status=normalized_status,
+            sort=sort,
+            mode=mode,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+    except InvalidCursorError as exc:
+        raise HTTPException(
+            400,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except search.PaginationConflictError as exc:
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_pagination", "message": str(exc)},
+        ) from exc
+    except search.UnsupportedSearchModeError as exc:
+        raise HTTPException(
+            400,
+            detail={"code": "unsupported_semantic_filters", "message": str(exc)},
+        ) from exc
+    except (FilterValidationError, QueryError) as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 def _get_asset_or_404(uuid: str) -> dict:
@@ -361,11 +429,42 @@ def asset_metadata(uuid: str, user: dict = Depends(require_user)):
 # Tags
 # ---------------------------------------------------------------------------
 @app.get("/api/tags")
-def list_tags(user: dict = Depends(require_user)):
-    rows = get_conn().execute(
+def list_tags(
+    q: str = "",
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(require_user),
+):
+    term = q.strip()
+    if len(term) > MAX_QUERY_LENGTH:
+        raise HTTPException(
+            422, f"Tag search is limited to {MAX_QUERY_LENGTH} characters"
+        )
+    where = ""
+    params: list = []
+    if term:
+        escaped = (
+            term.lower()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        where = "WHERE LOWER(t.name) LIKE ? ESCAPE '\\'"
+        params.append(f"%{escaped}%")
+
+    conn = get_conn()
+    total = conn.execute(f"SELECT COUNT(*) c FROM tags t {where}", params).fetchone()["c"]
+    sql = (
         "SELECT t.name, COUNT(at.asset_id) c FROM tags t "
-        "LEFT JOIN asset_tags at ON at.tag_id = t.id GROUP BY t.name ORDER BY c DESC, t.name").fetchall()
-    return {"tags": [dict(r) for r in rows]}
+        "LEFT JOIN asset_tags at ON at.tag_id = t.id "
+        f"{where} GROUP BY t.name ORDER BY c DESC, t.name"
+    )
+    query_params = list(params)
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        query_params.extend([limit, offset])
+    rows = conn.execute(sql, query_params).fetchall()
+    return {"tags": [dict(r) for r in rows], "total": total}
 
 
 # ---------------------------------------------------------------------------
