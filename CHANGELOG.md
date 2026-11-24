@@ -8,6 +8,21 @@ semantic versioning.
 
 ### Added
 
+- Combined asset search with keyword, media type, collection, all-of included
+  tags, and any-of excluded tags, while still honoring the selected sort.
+- Signed, bidirectional keyset pagination with a deterministic id tie-breaker,
+  a filter/sort/page-size fingerprint, and legacy `limit`/`offset` compatibility.
+- Bounded streaming CSV export with a single read snapshot, required and optional
+  columns, UTF-8 BOM/CRLF output, JSON tag arrays, and spreadsheet formula
+  protection that can be disabled.
+- A search toolbar with removable filter chips, searchable paginated tag
+  candidates, include/exclude tag modes, and URL-restored filter/sort state.
+- Versioned SQLite migrations, search indexes, and a trigger-maintained
+  `tag_usage` table for fast active-tag facets.
+- Playwright browser tests for filtering, pagination, export downloads, list
+  failures, request races, and authenticated asset downloads.
+- A reproducible 100k-asset benchmark script for list latency and full export.
+
 - Parse common XMP RDF fields into structured metadata, catalog fields, and
   full-text search.
 - OCR images at ingest through the Tesseract binary when it is installed, so
@@ -30,6 +45,18 @@ semantic versioning.
   Tunable with `KEEPSTACK_LOGIN_MAX_ATTEMPTS` and `KEEPSTACK_LOGIN_LOCKOUT_SECONDS`.
 
 ### Changed
+
+- The library now uses a top filter toolbar and cursor pagination instead of
+  the old sidebar facets and single-tag filter. Semantic search remains in the
+  legacy API but is hidden from the web interface.
+- Keyword searches honor the selected time or metadata sort instead of always
+  ordering by FTS relevance.
+- Tag and media facets use active assets and are no longer presented as counts
+  for the current result set.
+- The asset detail Download action now carries the Bearer token through a
+  protected fetch, and JSON requests default to POST when no method is supplied.
+- FTS filtering uses a rowid subquery, avoiding per-asset virtual-table probes
+  on large catalogs.
 
 - Switched the web interface to a light theme: white and soft-gray surfaces
   with an indigo accent, applied across the app, placeholders, and share pages.
