@@ -38,12 +38,16 @@ def _add_tag(page, tag: str) -> None:
 
 def test_library_loads_with_keyword_only_interface(logged_in_page):
     page = logged_in_page
-    expect(page.locator("#grid .card")).to_have_count(24)
+    expect(page.locator("#grid .card")).to_have_count(10)
     expect(page.locator("#result-summary")).to_have_text("33 assets")
     expect(page.locator("#search-mode")).to_have_count(0)
     expect(page.locator("#facets")).to_have_count(0)
     expect(page.locator("#btn-clear-filters")).to_be_disabled()
     expect(page.locator("#page-label")).to_have_text("Page 1")
+    row_tops = page.locator("#grid .card").evaluate_all(
+        "cards => cards.map(card => Math.round(card.getBoundingClientRect().top))"
+    )
+    assert row_tops.count(row_tops[0]) == 5
 
 
 def test_tag_candidates_load_more(logged_in_page):
@@ -83,7 +87,7 @@ def test_combined_filters_active_chips_and_clear(logged_in_page):
 
     page.select_option("#sort", "oldest")
     expect(page.locator("#result-summary")).to_have_text("13 assets")
-    page.select_option("#page-size", "48")
+    page.select_option("#page-size", "20")
     expect(page.locator("#result-summary")).to_have_text("13 assets")
 
     page.click("#btn-clear-filters")
@@ -91,7 +95,7 @@ def test_combined_filters_active_chips_and_clear(logged_in_page):
     expect(page.locator("#search")).to_have_value("")
     expect(page.locator("#filter-collection")).to_have_value("")
     expect(page.locator("#sort")).to_have_value("oldest")
-    expect(page.locator("#page-size")).to_have_value("48")
+    expect(page.locator("#page-size")).to_have_value("20")
     expect(page.locator("#active-filters")).to_be_hidden()
 
 
@@ -120,24 +124,36 @@ def test_cursor_pagination_is_stable_with_equal_timestamps(logged_in_page):
     page = logged_in_page
     page.fill("#search", "harbor")
     expect(page.locator("#result-summary")).to_have_text("30 assets")
-    expect(page.locator("#grid .card")).to_have_count(24)
+    expect(page.locator("#grid .card")).to_have_count(10)
     expect(page.locator("#prev-page")).to_be_disabled()
     expect(page.locator("#next-page")).to_be_enabled()
     first_ids = _card_ids(page)
 
     page.click("#next-page")
     expect(page.locator("#page-label")).to_have_text("Page 2")
-    expect(page.locator("#grid .card")).to_have_count(6)
+    expect(page.locator("#grid .card")).to_have_count(10)
     expect(page.locator("#prev-page")).to_be_enabled()
-    expect(page.locator("#next-page")).to_be_disabled()
+    expect(page.locator("#next-page")).to_be_enabled()
     second_ids = _card_ids(page)
 
+    page.click("#next-page")
+    expect(page.locator("#page-label")).to_have_text("Page 3")
+    expect(page.locator("#grid .card")).to_have_count(10)
+    expect(page.locator("#prev-page")).to_be_enabled()
+    expect(page.locator("#next-page")).to_be_disabled()
+    third_ids = _card_ids(page)
+
+    all_ids = first_ids + second_ids + third_ids
     assert set(first_ids).isdisjoint(set(second_ids))
-    assert len(set(first_ids + second_ids)) == 30
+    assert set(first_ids).isdisjoint(set(third_ids))
+    assert set(second_ids).isdisjoint(set(third_ids))
+    assert len(set(all_ids)) == 30
 
     page.click("#prev-page")
+    expect(page.locator("#page-label")).to_have_text("Page 2")
+    page.click("#prev-page")
     expect(page.locator("#page-label")).to_have_text("Page 1")
-    expect(page.locator("#grid .card")).to_have_count(24)
+    expect(page.locator("#grid .card")).to_have_count(10)
     assert _card_ids(page) == first_ids
 
 

@@ -9,7 +9,7 @@ const SORT_LABELS = {
   name: "Name A-Z",
   largest: "Largest first",
 };
-const PAGE_SIZES = [24, 48, 96];
+const PAGE_SIZES = [10, 20, 50];
 const PAGE_SIZE_KEY = "keepstack_page_size";
 const EXPORT_PREFS_KEY = "keepstack_export_optional_columns";
 
@@ -66,7 +66,7 @@ function uniqueTags(values) {
 
 function parsePageSize(raw) {
   const value = Number(raw);
-  return PAGE_SIZES.includes(value) ? value : 24;
+  return PAGE_SIZES.includes(value) ? value : 10;
 }
 
 function loadExportPreferences() {
@@ -86,7 +86,7 @@ const initialCollection = /^\d+$/.test(initialCollectionRaw) && Number(initialCo
 const initialSort = SORT_VALUES.includes(initialParams.get("sort"))
   ? initialParams.get("sort")
   : "newest";
-const initialPageSize = parsePageSize(localStorage.getItem(PAGE_SIZE_KEY) || "24");
+const initialPageSize = parsePageSize(localStorage.getItem(PAGE_SIZE_KEY) || "10");
 
 const state = {
   token: localStorage.getItem("keepstack_token"),
