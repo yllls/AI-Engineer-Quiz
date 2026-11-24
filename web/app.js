@@ -887,7 +887,10 @@ async function openAsset(uuid) {
       <div class="detail-section"><h4>Tags</h4>
         <div class="tag-row" id="tag-row">
           ${detail.tags.map(tag => `<span class="tag ${tag.source === "ai" ? "ai" : ""}">${esc(tag.name)}${canEdit ? `<span class="rm" data-tag="${esc(tag.name)}">&times;</span>` : ""}</span>`).join("")}
-          ${canEdit ? '<input class="tag-add" id="tag-add" placeholder="+ add tag">' : ""}
+          ${canEdit ? `<form class="tag-add-form" id="tag-add-form">
+            <input class="tag-add" id="tag-add" placeholder="+ add tag" aria-label="New tag name">
+            <button class="btn tag-add-submit" id="tag-add-submit" type="submit">Add</button>
+          </form>` : ""}
         </div></div>
 
       ${similar.items.length ? `<div class="detail-section"><h4>Similar assets</h4>
@@ -934,14 +937,26 @@ async function openAsset(uuid) {
           toast(err.message || "Save failed.", "err");
         }
       });
-      $("#tag-add").addEventListener("keydown", async (event) => {
-        if (event.key !== "Enter" || !event.target.value.trim()) return;
+      $("#tag-add-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const input = $("#tag-add");
+        const submit = $("#tag-add-submit");
+        const name = input.value.trim();
+        if (!name) {
+          toast("Enter a tag name.", "err");
+          input.focus();
+          return;
+        }
+        if (submit.disabled) return;
+        submit.disabled = true;
         try {
-          await api("/api/assets/" + encodeURIComponent(uuid) + "/tags", { json: { name: event.target.value.trim() } });
+          await api("/api/assets/" + encodeURIComponent(uuid) + "/tags", { json: { name } });
           await openAsset(uuid);
           reloadCurrentPage();
         } catch (err) {
           toast(err.message || "Could not add tag.", "err");
+          submit.disabled = false;
+          input.focus();
         }
       });
       $$("#tag-row .rm").forEach(remove => remove.addEventListener("click", async () => {

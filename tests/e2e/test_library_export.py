@@ -328,3 +328,20 @@ def test_latest_filter_wins_when_an_older_request_is_slow(page, e2e_server):
     page.wait_for_timeout(1200)
     expect(page.locator("#result-summary")).to_have_text("3 assets")
     assert "q=mountain" in page.url
+
+
+def test_asset_tag_can_be_added_with_button(logged_in_page):
+    page = logged_in_page
+    tag = "bulk-tag-24"
+    page.locator("#grid .card").first.click()
+    expect(page.locator("#drawer")).to_be_visible()
+    expect(page.locator("#tag-add-submit")).to_be_visible()
+    expect(page.locator("#tag-add-submit")).to_be_enabled()
+
+    page.fill("#tag-add", tag)
+    page.click("#tag-add-submit")
+    tag_chip = page.locator("#tag-row .tag").filter(has_text=tag)
+    expect(tag_chip).to_be_visible()
+
+    page.locator(f'#tag-row .rm[data-tag="{tag}"]').click()
+    expect(page.locator("#tag-row .tag").filter(has_text=tag)).to_have_count(0)

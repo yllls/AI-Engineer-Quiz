@@ -51,6 +51,8 @@ semantic versioning.
   legacy API but is hidden from the web interface.
 - The asset library defaults to 10 items per page, offers 10/20/50, and uses a
   five-column desktop grid so 10-item pages form two complete rows.
+- Asset tag editing now has an explicit Add button beside the tag input; Enter
+  continues to submit the same form.
 - Keyword searches honor the selected time or metadata sort instead of always
   ordering by FTS relevance.
 - Tag and media facets use active assets and are no longer presented as counts

@@ -244,7 +244,9 @@ button, input, select { font-family: inherit; font-size: inherit; }
 }
 .tag.ai { border-color: var(--accent); color: var(--accent); }
 .tag .rm { cursor: pointer; color: var(--muted); }
-.tag-add { background: var(--base-0); border: 1px dashed var(--base-3); border-radius: 999px; padding: 4px var(--s2); color: var(--text); width: 120px; }
+.tag-add-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tag-add { background: var(--base-0); border: 1px dashed var(--base-3); border-radius: 999px; padding: 4px var(--s2); color: var(--text); width: 130px; }
+.tag-add-submit { padding: 4px 12px; font-size: 13px; }
 .similar-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--s2); }
 .similar-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: var(--radius-sm); cursor: pointer; border: 1px solid var(--base-3); }
 .kv-scroll { max-height: 260px; overflow: auto; background: var(--base-0); border-radius: var(--radius-sm); padding: var(--s2); }
