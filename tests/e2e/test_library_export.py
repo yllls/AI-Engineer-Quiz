@@ -9,6 +9,7 @@ import os
 import re
 
 import pytest
+from PIL import Image
 
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect  # noqa: E402
@@ -345,3 +346,91 @@ def test_asset_tag_can_be_added_with_button(logged_in_page):
 
     page.locator(f'#tag-row .rm[data-tag="{tag}"]').click()
     expect(page.locator("#tag-row .tag").filter(has_text=tag)).to_have_count(0)
+
+
+def test_upload_targets_current_collection_and_finishes_all_rows(logged_in_page, tmp_path):
+    page = logged_in_page
+    expect(page.locator("#filter-collection option").filter(has_text="Harbor Campaign")).to_have_count(1)
+    page.select_option("#filter-collection", label="Harbor Campaign")
+    expect(page.locator("#result-summary")).to_have_text("20 assets")
+    collection_value = page.locator("#filter-collection").input_value()
+
+    def make_image(name, color):
+        path = tmp_path / name
+        Image.new("RGB", (48, 36), color).save(path, format="JPEG")
+        return str(path)
+
+    first_image = make_image("upload-one.jpg", (17, 83, 151))
+    duplicate_image = make_image("upload-duplicate.jpg", (17, 83, 151))
+    second_image = make_image("upload-two.jpg", (203, 71, 19))
+
+    page.click("#btn-upload")
+    expect(page.locator("#upload-modal")).to_be_visible()
+    expect(page.locator("#upload-collection")).to_be_enabled()
+    expect(page.locator("#upload-collection")).to_have_value(collection_value)
+    page.uncheck("#ai-toggle")
+    page.set_input_files("#file-input", [first_image, duplicate_image, second_image])
+    expect(page.locator("#upload-list .upload-item")).to_have_count(3)
+    expect(page.locator("#upload-summary")).to_be_visible(timeout=15000)
+
+    statuses = page.locator("#upload-list .upload-status").all_text_contents()
+    assert all("uploading" not in status.lower() for status in statuses)
+    assert sum("added to" in status.lower() for status in statuses) == 2
+    assert sum("already in" in status.lower() for status in statuses) == 1
+
+    page.click("#upload-cancel")
+    expect(page.locator("#result-summary")).to_have_text("22 assets", timeout=15000)
+
+    page.click("#btn-upload")
+    expect(page.locator("#upload-list .upload-item")).to_have_count(0)
+    page.click("#upload-cancel")
+
+
+def test_user_edit_disable_and_permanent_delete(logged_in_page):
+    page = logged_in_page
+    username = "e2e-managed-user"
+    page.locator('.nav-item[data-view="users"]').click()
+    expect(page.locator("#user-rows tr").first).to_be_visible()
+
+    self_row = page.locator("#user-rows tr").filter(has_text="You")
+    expect(self_row.locator('button[data-user-action="toggle"]')).to_be_disabled()
+    expect(self_row.locator('button[data-user-action="delete"]')).to_be_disabled()
+
+    page.click("#btn-new-user")
+    expect(page.locator("#user-modal")).to_be_visible()
+    page.fill("#user-username", username)
+    page.fill("#user-email", "managed@example.org")
+    page.fill("#user-full-name", "Managed User")
+    page.select_option("#user-role", "contributor")
+    page.fill("#user-password", "managed-pass-1")
+    page.click("#user-save")
+    expect(page.locator("#user-modal")).to_be_hidden()
+    row = page.locator("#user-rows tr").filter(has_text=username)
+    expect(row).to_be_visible()
+    expect(row).to_contain_text("managed@example.org")
+
+    row.locator('button[data-user-action="edit"]').click()
+    expect(page.locator("#user-modal")).to_be_visible()
+    page.fill("#user-full-name", "Edited Managed User")
+    page.fill("#user-email", "edited@example.org")
+    page.select_option("#user-role", "editor")
+    page.click("#user-save")
+    expect(page.locator("#user-modal")).to_be_hidden()
+    row = page.locator("#user-rows tr").filter(has_text=username)
+    expect(row).to_contain_text("Edited Managed User")
+    expect(row).to_contain_text("edited@example.org")
+    expect(row).to_contain_text("editor")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    row.locator('button[data-user-action="toggle"]').click()
+    expect(page.locator("#user-rows tr").filter(has_text=username)).to_contain_text("Inactive")
+
+    page.locator("#user-rows tr").filter(has_text=username).locator(
+        'button[data-user-action="delete"]'
+    ).click()
+    expect(page.locator("#delete-user-modal")).to_be_visible()
+    page.fill("#delete-user-input", username)
+    expect(page.locator("#delete-user-confirm")).to_be_enabled()
+    page.click("#delete-user-confirm")
+    expect(page.locator("#delete-user-modal")).to_be_hidden()
+    expect(page.locator("#user-rows tr").filter(has_text=username)).to_have_count(0)

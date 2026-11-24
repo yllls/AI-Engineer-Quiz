@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import sqlite3
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -21,7 +22,7 @@ from starlette.background import BackgroundTask
 
 from . import __version__, ingest, search, standards, storage, thumbnails
 from .audit import log, now_iso
-from .auth import (authenticate, hash_password, login_locked, make_token,
+from .auth import (ROLES, authenticate, hash_password, login_locked, make_token,
                    note_login_failure, note_login_success, role_at_least,
                    verify_password, verify_token)
 from .config import config
@@ -68,7 +69,11 @@ def optional_user(request: Request) -> Optional[dict]:
     row = get_conn().execute(
         "SELECT * FROM users WHERE id = ? AND is_active = 1", (payload["sub"],)
     ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    if int(payload.get("ver", 0)) != int(row["token_version"]):
+        return None
+    return dict(row)
 
 
 def require_user(request: Request) -> dict:
@@ -142,7 +147,10 @@ def login(request: Request, body: dict = Body(...)):
     get_conn().execute("UPDATE users SET last_login = ? WHERE id = ?", (now_iso(), user["id"]))
     get_conn().commit()
     log("login.success", user=user, ip=ip)
-    return {"token": make_token(user["id"], user["role"]), "user": _user_public(user)}
+    return {
+        "token": make_token(user["id"], user["role"], user.get("token_version", 0)),
+        "user": _user_public(user),
+    }
 
 
 @app.get("/api/auth/me")
@@ -163,9 +171,26 @@ async def upload_assets(
     request: Request,
     files: list[UploadFile] = File(...),
     run_ai: bool = Form(True),
+    collection_id: Optional[int] = Form(None, ge=1),
     user: dict = Depends(require_role("contributor")),
 ):
+    target_collection = None
+    if collection_id is not None:
+        row = get_conn().execute(
+            "SELECT id, name FROM collections WHERE id = ?", (collection_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "collection_not_found",
+                    "message": "The selected collection does not exist",
+                },
+            )
+        target_collection = dict(row)
+
     results = []
+    added_count = 0
     for f in files:
         data = await f.read()
         asset = ingest.ingest_stream(io.BytesIO(data), f.filename or "upload.bin",
@@ -173,9 +198,41 @@ async def upload_assets(
         if not asset.get("duplicate"):
             log("asset.create", user=user, target_type="asset", target_id=asset["uuid"],
                 detail=asset["filename"], ip=client_ip(request))
-        results.append({"uuid": asset["uuid"], "title": asset["title"],
-                        "duplicate": asset.get("duplicate", False),
-                        "media_type": asset["media_type"]})
+
+        collection_added = False
+        collection_error = None
+        if target_collection is not None:
+            try:
+                with transaction() as conn:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO collection_assets "
+                        "(collection_id, asset_id, added_at) VALUES (?,?,?)",
+                        (target_collection["id"], asset["id"], now_iso()),
+                    )
+                collection_added = bool(cur.rowcount)
+                if collection_added:
+                    added_count += 1
+            except sqlite3.IntegrityError:
+                # The target can disappear between validation and association.
+                # The upload itself stays successful; report only the link error.
+                collection_error = "Collection no longer exists"
+            except Exception:
+                collection_error = "Could not add the asset to the collection"
+
+        results.append({
+            "uuid": asset["uuid"],
+            "title": asset["title"],
+            "duplicate": asset.get("duplicate", False),
+            "media_type": asset["media_type"],
+            "collection_id": target_collection["id"] if target_collection else None,
+            "collection_added": collection_added,
+            "collection_error": collection_error,
+        })
+
+    if target_collection is not None and added_count:
+        log("collection.add", user=user, target_type="collection",
+            target_id=target_collection["id"],
+            detail=f"{added_count} uploaded assets", ip=client_ip(request))
     return {"created": results}
 
 
@@ -608,15 +665,18 @@ def add_to_collection(cid: int, body: dict = Body(...),
                       user: dict = Depends(require_role("contributor"))):
     uuids = body.get("uuids", [])
     conn = get_conn()
+    if not conn.execute("SELECT 1 FROM collections WHERE id = ?", (cid,)).fetchone():
+        raise HTTPException(404, "Collection not found")
     added = 0
     with transaction() as conn:
         for u in uuids:
             row = conn.execute("SELECT id FROM assets WHERE uuid = ?", (u,)).fetchone()
             if row:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id, added_at) VALUES (?,?,?)",
                     (cid, row["id"], now_iso()))
-                added += 1
+                if cur.rowcount:
+                    added += 1
     log("collection.add", user=user, target_type="collection", target_id=cid, detail=f"{added} assets")
     return {"ok": True, "added": added}
 
@@ -746,6 +806,68 @@ def stats(user: dict = Depends(require_user)):
             "tags": tags, "collections": cols, "dedup_saved_bytes": dup}
 
 
+CREATE_USER_FIELDS = {"username", "email", "full_name", "role", "password", "is_active"}
+UPDATE_USER_FIELDS = {"email", "full_name", "role", "is_active", "password"}
+
+
+def _user_http_error(status: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status, detail={"code": code, "message": message})
+
+
+def _unknown_fields_error(body: dict, allowed: set[str]) -> None:
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise _user_http_error(
+            422,
+            "unsupported_user_fields",
+            "Unsupported fields: " + ", ".join(unknown),
+        )
+
+
+def _coerce_active(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise _user_http_error(422, "invalid_is_active", "is_active must be a boolean")
+
+
+def _optional_text(value, field: str):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _user_http_error(422, "invalid_user_field", f"{field} must be a string")
+    stripped = value.strip()
+    return stripped or None
+
+
+def _validated_role(value: str) -> str:
+    if value not in ROLES:
+        raise _user_http_error(422, "invalid_role", f"Role must be one of: {', '.join(ROLES)}")
+    return value
+
+
+def _get_user_row(uid: int) -> dict:
+    row = get_conn().execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "User not found")
+    return dict(row)
+
+
+def _public_admin_user(row) -> dict:
+    data = dict(row)
+    return {
+        "id": data["id"],
+        "username": data["username"],
+        "email": data.get("email"),
+        "full_name": data.get("full_name"),
+        "role": data["role"],
+        "is_active": bool(data["is_active"]),
+        "created_at": data.get("created_at"),
+        "last_login": data.get("last_login"),
+    }
+
+
 @app.get("/api/users")
 def list_users(user: dict = Depends(require_role("admin"))):
     rows = get_conn().execute(
@@ -756,32 +878,146 @@ def list_users(user: dict = Depends(require_role("admin"))):
 
 @app.post("/api/users")
 def create_user(request: Request, body: dict = Body(...), user: dict = Depends(require_role("admin"))):
+    _unknown_fields_error(body, CREATE_USER_FIELDS)
+    username = body.get("username")
+    if not isinstance(username, str) or not username.strip():
+        raise _user_http_error(422, "invalid_username", "Username is required")
+    username = username.strip()
+    password = body.get("password")
+    if not isinstance(password, str) or not password:
+        raise _user_http_error(422, "invalid_password", "Initial password is required")
+    role = _validated_role(body.get("role", "viewer"))
+    is_active = _coerce_active(body.get("is_active", True))
+    email = _optional_text(body.get("email"), "email")
+    full_name = _optional_text(body.get("full_name"), "full_name")
+
     try:
         with transaction() as conn:
             cur = conn.execute(
-                "INSERT INTO users (username, email, full_name, password_hash, role, is_active, created_at) "
-                "VALUES (?,?,?,?,?,1,?)",
-                (body["username"], body.get("email"), body.get("full_name"),
-                 hash_password(body["password"]), body.get("role", "viewer"), now_iso()))
-    except Exception:
-        raise HTTPException(409, "Username already exists")
-    log("user.create", user=user, target_type="user", target_id=body["username"])
-    return {"id": cur.lastrowid}
+                "INSERT INTO users "
+                "(username, email, full_name, password_hash, role, is_active, created_at, token_version) "
+                "VALUES (?,?,?,?,?,?,?,0)",
+                (username, email, full_name, hash_password(password), role,
+                 1 if is_active else 0, now_iso()))
+    except sqlite3.IntegrityError as exc:
+        raise _user_http_error(409, "username_exists", "Username already exists") from exc
+
+    log("user.create", user=user, target_type="user", target_id=username,
+        detail=f"role={role}, active={int(is_active)}")
+    created = _get_user_row(int(cur.lastrowid))
+    return {"id": cur.lastrowid, "user": _public_admin_user(created)}
 
 
 @app.patch("/api/users/{uid}")
 def update_user(uid: int, body: dict = Body(...), user: dict = Depends(require_role("admin"))):
-    sets, vals = [], []
-    for k in ("email", "full_name", "role", "is_active"):
-        if k in body:
-            sets.append(f"{k} = ?"); vals.append(body[k])
-    if body.get("password"):
-        sets.append("password_hash = ?"); vals.append(hash_password(body["password"]))
-    if sets:
-        vals.append(uid)
+    target = _get_user_row(uid)
+    if "username" in body:
+        raise _user_http_error(422, "username_immutable", "Username cannot be changed")
+    _unknown_fields_error(body, UPDATE_USER_FIELDS)
+
+    changes: dict = {}
+    changed_fields: list[str] = []
+    password_changed = False
+
+    if "email" in body:
+        email = _optional_text(body.get("email"), "email")
+        if email != target.get("email"):
+            changes["email"] = email
+            changed_fields.append("email")
+    if "full_name" in body:
+        full_name = _optional_text(body.get("full_name"), "full_name")
+        if full_name != target.get("full_name"):
+            changes["full_name"] = full_name
+            changed_fields.append("full_name")
+    if "role" in body:
+        role = _validated_role(body["role"])
+        if uid == user["id"] and role != target["role"]:
+            raise _user_http_error(409, "cannot_change_own_role", "You cannot change your own role")
+        if role != target["role"]:
+            changes["role"] = role
+            changed_fields.append("role")
+    if "is_active" in body:
+        active = _coerce_active(body["is_active"])
+        if uid == user["id"] and not active:
+            raise _user_http_error(409, "cannot_deactivate_self", "You cannot deactivate yourself")
+        if bool(target["is_active"]) != active:
+            changes["is_active"] = 1 if active else 0
+            changed_fields.append("is_active")
+    if "password" in body:
+        password = body.get("password")
+        if password not in (None, ""):
+            if not isinstance(password, str):
+                raise _user_http_error(422, "invalid_password", "Password must be a string")
+            changes["password_hash"] = hash_password(password)
+            password_changed = True
+            changed_fields.append("password")
+
+    new_role = changes.get("role", target["role"])
+    new_active = bool(changes["is_active"]) if "is_active" in changes else bool(target["is_active"])
+    if target["role"] == "admin" and target["is_active"] and (new_role != "admin" or not new_active):
+        other_admins = get_conn().execute(
+            "SELECT COUNT(*) c FROM users WHERE role = 'admin' AND is_active = 1 AND id != ?",
+            (uid,),
+        ).fetchone()["c"]
+        if not other_admins:
+            raise _user_http_error(
+                409,
+                "last_active_admin",
+                "At least one active administrator must remain",
+            )
+
+    invalidate_tokens = password_changed or (target["is_active"] and not new_active)
+    if invalidate_tokens:
+        changes["token_version"] = "token_version + 1"
+        changed_fields.append("token_version")
+
+    if changes:
+        assignments = []
+        values = []
+        for key, value in changes.items():
+            if key == "token_version":
+                assignments.append("token_version = token_version + 1")
+            else:
+                assignments.append(f"{key} = ?")
+                values.append(value)
+        values.append(uid)
         with transaction() as conn:
-            conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", vals)
-    log("user.update", user=user, target_type="user", target_id=uid)
+            conn.execute(
+                f"UPDATE users SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+        log("user.update", user=user, target_type="user", target_id=uid,
+            detail=",".join(changed_fields))
+        if "is_active" in changes:
+            action = "user.activate" if changes["is_active"] else "user.deactivate"
+            log(action, user=user, target_type="user", target_id=uid,
+                detail=target["username"])
+
+    return {"ok": True, "user": _public_admin_user(_get_user_row(uid))}
+
+
+@app.delete("/api/users/{uid}")
+def delete_user(uid: int, user: dict = Depends(require_role("admin"))):
+    target = _get_user_row(uid)
+    if uid == user["id"]:
+        raise _user_http_error(409, "cannot_delete_self", "You cannot delete yourself")
+    if target["is_active"]:
+        raise _user_http_error(
+            409,
+            "deactivate_first",
+            "Deactivate the user before deleting them permanently",
+        )
+    with transaction() as conn:
+        # Most of these columns predate foreign keys. Clear them explicitly so
+        # a permanent deletion does not leave dangling user ids.
+        conn.execute("UPDATE assets SET uploaded_by = NULL WHERE uploaded_by = ?", (uid,))
+        conn.execute("UPDATE asset_versions SET created_by = NULL WHERE created_by = ?", (uid,))
+        conn.execute("UPDATE collections SET created_by = NULL WHERE created_by = ?", (uid,))
+        conn.execute("UPDATE share_links SET created_by = NULL WHERE created_by = ?", (uid,))
+        conn.execute("DELETE FROM saved_searches WHERE user_id = ?", (uid,))
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+    log("user.delete", user=user, target_type="user", target_id=uid,
+        detail=target["username"])
     return {"ok": True}
 
 

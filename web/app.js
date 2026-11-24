@@ -203,7 +203,9 @@ async function api(path, opts = {}) {
 function syncModalState() {
   const open = !$("#drawer").classList.contains("hidden")
     || !$("#upload-modal").classList.contains("hidden")
-    || !$("#export-modal").classList.contains("hidden");
+    || !$("#export-modal").classList.contains("hidden")
+    || !$("#user-modal").classList.contains("hidden")
+    || !$("#delete-user-modal").classList.contains("hidden");
   document.body.classList.toggle("modal-open", open);
 }
 
@@ -217,6 +219,8 @@ function logout() {
   closeTagResults();
   $("#drawer").classList.add("hidden");
   $("#upload-modal").classList.add("hidden");
+  $("#user-modal").classList.add("hidden");
+  $("#delete-user-modal").classList.add("hidden");
   $("#app").classList.add("hidden");
   $("#login").classList.remove("hidden");
   $("#user-label").textContent = "";
@@ -997,24 +1001,78 @@ async function openAsset(uuid) {
 
 // ---------- upload ----------
 const uploadModal = $("#upload-modal");
-$("#btn-upload").addEventListener("click", () => {
-  uploadModal.classList.remove("hidden");
-  syncModalState();
-});
-$("#upload-cancel").addEventListener("click", () => {
-  uploadModal.classList.add("hidden");
-  syncModalState();
-  reloadCurrentPage();
-});
-$("#upload-modal .modal-backdrop").addEventListener("click", () => {
-  uploadModal.classList.add("hidden");
-  syncModalState();
-  reloadCurrentPage();
-});
 const dropzone = $("#dropzone");
 const fileInput = $("#file-input");
-dropzone.addEventListener("click", () => fileInput.click());
+const UPLOAD_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+let uploadBusy = false;
+let uploadOptionsLoading = false;
+
+function updateUploadInteractionState() {
+  const blocked = uploadBusy || uploadOptionsLoading;
+  $("#upload-collection").disabled = blocked;
+  $("#ai-toggle").disabled = uploadBusy;
+  fileInput.disabled = blocked;
+  dropzone.classList.toggle("disabled", blocked);
+}
+
+function renderUploadCollectionOptions() {
+  const select = $("#upload-collection");
+  const current = state.collection;
+  const collections = [...state.collections].sort((a, b) => a.name.localeCompare(b.name));
+  select.innerHTML = '<option value="">No collection</option>' +
+    collections.map(collection => `<option value="${collection.id}">${esc(collection.name)}</option>`).join("");
+  if (current && collections.some(collection => String(collection.id) === String(current))) {
+    select.value = String(current);
+  } else {
+    select.value = "";
+  }
+}
+
+async function openUploadModal() {
+  uploadModal.classList.remove("hidden");
+  syncModalState();
+  if (uploadBusy) {
+    updateUploadInteractionState();
+    return;
+  }
+
+  $("#upload-list").innerHTML = "";
+  $("#upload-summary").classList.add("hidden");
+  $("#upload-summary").textContent = "";
+  fileInput.value = "";
+  renderUploadCollectionOptions();
+  uploadOptionsLoading = true;
+  updateUploadInteractionState();
+  try {
+    await fetchCollections(true);
+    renderUploadCollectionOptions();
+  } catch (err) {
+    toast(err.message || "Could not refresh collections. Using the cached list.", "err");
+  } finally {
+    uploadOptionsLoading = false;
+    updateUploadInteractionState();
+  }
+}
+
+function closeUploadModal() {
+  if (uploadBusy && !window.confirm("Uploads are still running. Close the window and let them finish in the background?")) {
+    return;
+  }
+  uploadModal.classList.add("hidden");
+  syncModalState();
+  reloadCurrentPage();
+}
+
+$("#btn-upload").addEventListener("click", openUploadModal);
+$("#upload-cancel").addEventListener("click", closeUploadModal);
+$("#upload-modal .modal-backdrop").addEventListener("click", closeUploadModal);
+
+dropzone.addEventListener("click", () => {
+  if (uploadBusy || uploadOptionsLoading) return;
+  fileInput.click();
+});
 dropzone.addEventListener("dragover", event => {
+  if (uploadBusy || uploadOptionsLoading) return;
   event.preventDefault();
   dropzone.classList.add("drag");
 });
@@ -1022,28 +1080,129 @@ dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
 dropzone.addEventListener("drop", event => {
   event.preventDefault();
   dropzone.classList.remove("drag");
+  if (uploadBusy || uploadOptionsLoading) {
+    toast("Wait for the current uploads to finish.", "err");
+    return;
+  }
   uploadFiles(event.dataTransfer.files);
 });
 fileInput.addEventListener("change", () => uploadFiles(fileInput.files));
 
+function setUploadStatus(row, text, kind, detail = "") {
+  row.className = "upload-item " + kind;
+  const status = row.querySelector(".upload-status");
+  if (status) status.textContent = text;
+  row.title = detail || text;
+}
+
+function uploadResultLabel(created, collectionId, collectionLabel) {
+  if (!created) throw new Error("Unexpected upload response");
+  if (created.collection_error) {
+    const base = created.duplicate ? "duplicate" : "uploaded";
+    return [`${base}, not added to collection`, "warn", created.collection_error];
+  }
+  if (collectionId) {
+    const base = created.duplicate ? "duplicate" : "uploaded";
+    if (created.collection_added) {
+      return [`${base}, added to ${collectionLabel}`, created.duplicate ? "dup" : "ok", ""];
+    }
+    return [`${base}, already in ${collectionLabel}`, "dup", ""];
+  }
+  return created.duplicate
+    ? ["duplicate (deduped)", "dup", ""]
+    : ["done", "ok", ""];
+}
+
 async function uploadFiles(files) {
+  const fileList = [...files];
+  if (!fileList.length) return;
+  if (uploadBusy) {
+    toast("Wait for the current uploads to finish.", "err");
+    return;
+  }
+
+  const collectionSelect = $("#upload-collection");
+  const collectionId = collectionSelect.value || null;
+  const collectionLabel = collectionSelect.selectedOptions[0]?.textContent || "collection";
+  const runAi = $("#ai-toggle").checked;
   const list = $("#upload-list");
-  for (const file of files) {
-    const row = document.createElement("div");
-    row.className = "upload-item";
-    row.innerHTML = `<span>${esc(file.name)}</span><span>uploading...</span>`;
-    list.prepend(row);
-    const formData = new FormData();
-    formData.append("files", file);
-    formData.append("run_ai", $("#ai-toggle").checked);
-    try {
-      const result = await api("/api/assets", { method: "POST", body: formData });
-      const created = result.created[0];
-      row.classList.add(created.duplicate ? "dup" : "ok");
-      row.lastChild.textContent = created.duplicate ? "duplicate (deduped)" : "done";
-    } catch {
-      row.classList.add("err");
-      row.lastChild.textContent = "failed";
+  list.innerHTML = "";
+  $("#upload-summary").classList.add("hidden");
+
+  uploadBusy = true;
+  updateUploadInteractionState();
+  let successCount = 0;
+  let failureCount = 0;
+
+  try {
+    for (const file of fileList) {
+      const row = document.createElement("div");
+      row.className = "upload-item";
+      row.innerHTML = `<span class="upload-name">${esc(file.name)}</span><span class="upload-status">uploading...</span>`;
+      list.appendChild(row);
+      setUploadStatus(row, "uploading...", "uploading");
+
+      const controller = new AbortController();
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, UPLOAD_REQUEST_TIMEOUT_MS);
+
+      try {
+        const formData = new FormData();
+        formData.append("files", file);
+        formData.append("run_ai", runAi ? "true" : "false");
+        if (collectionId) formData.append("collection_id", collectionId);
+        const result = await api("/api/assets", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        const [label, kind, detail] = uploadResultLabel(
+          result.created && result.created[0],
+          collectionId,
+          collectionLabel
+        );
+        setUploadStatus(row, label, kind, detail);
+        successCount += 1;
+      } catch (err) {
+        if (timedOut || err.name === "AbortError") {
+          setUploadStatus(
+            row,
+            "timed out, refresh the library to check",
+            "warn",
+            "The browser stopped waiting for this upload. The server may still finish it."
+          );
+        } else {
+          setUploadStatus(row, "failed", "err", err.message || "Upload failed.");
+        }
+        failureCount += 1;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+  } finally {
+    uploadBusy = false;
+    fileInput.value = "";
+    updateUploadInteractionState();
+    const total = successCount + failureCount;
+    const summary = $("#upload-summary");
+    summary.textContent = failureCount
+      ? `${successCount} succeeded, ${failureCount} failed`
+      : `${successCount} uploaded successfully`;
+    summary.classList.remove("hidden");
+    if (successCount) {
+      fetchCollections(true).catch(() => {});
+      reloadCurrentPage();
+    }
+    if (uploadModal.classList.contains("hidden") && total) {
+      toast(
+        failureCount
+          ? `Upload finished: ${successCount} succeeded, ${failureCount} failed`
+          : `Upload finished: ${successCount} succeeded`,
+        failureCount ? "err" : "ok"
+      );
     }
   }
 }
@@ -1104,22 +1263,231 @@ $("#btn-fixity").addEventListener("click", async () => {
 });
 
 // ---------- users ----------
+let userCache = [];
+let editingUserId = null;
+let pendingDeleteUser = null;
+
 async function loadUsers() {
   const data = await api("/api/users");
-  $("#user-rows").innerHTML = data.users.map(user =>
-    `<tr><td>${esc(user.username)}</td><td>${esc(user.email || "")}</td><td>${esc(user.role)}</td><td>${user.is_active ? "Yes" : "No"}</td><td>${esc((user.last_login || "").slice(0, 16).replace("T", " "))}</td></tr>`).join("");
+  userCache = data.users || [];
+  const selfId = state.user && state.user.id;
+  const activeAdmins = userCache.filter(user => user.role === "admin" && user.is_active);
+  $("#user-rows").innerHTML = userCache.map(user => {
+    const isSelf = user.id === selfId;
+    const lastActiveAdmin = user.role === "admin" && user.is_active && activeAdmins.length <= 1;
+    const toggleLabel = user.is_active ? "Disable" : "Enable";
+    const toggleDisabled = isSelf || (user.is_active && lastActiveAdmin);
+    const toggleTitle = isSelf
+      ? "You cannot change your own active state"
+      : (lastActiveAdmin ? "At least one active administrator must remain" : "");
+    const deleteDisabled = isSelf || user.is_active;
+    const deleteTitle = isSelf
+      ? "You cannot delete yourself"
+      : (user.is_active ? "Deactivate the user before permanent deletion" : "");
+    return `<tr data-uid="${user.id}">
+      <td>${esc(user.username)}${isSelf ? '<span class="self-badge">You</span>' : ""}</td>
+      <td>${esc(user.full_name || "")}</td>
+      <td>${esc(user.email || "")}</td>
+      <td>${esc(user.role)}</td>
+      <td><span class="status-pill ${user.is_active ? "active" : "inactive"}">${user.is_active ? "Active" : "Inactive"}</span></td>
+      <td>${esc((user.last_login || "").slice(0, 16).replace("T", " "))}</td>
+      <td><div class="table-actions">
+        <button class="btn btn-sm" type="button" data-user-action="edit" data-uid="${user.id}">Edit</button>
+        <button class="btn btn-sm" type="button" data-user-action="toggle" data-uid="${user.id}"
+                ${toggleDisabled ? "disabled" : ""} title="${esc(toggleTitle)}">${toggleLabel}</button>
+        <button class="btn btn-sm btn-danger" type="button" data-user-action="delete" data-uid="${user.id}"
+                ${deleteDisabled ? "disabled" : ""} title="${esc(deleteTitle)}">Delete</button>
+      </div></td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="7" class="muted">No users found.</td></tr>';
 }
-$("#btn-new-user").addEventListener("click", async () => {
-  const username = prompt("Username");
-  if (!username) return;
-  const password = prompt("Temporary password");
-  if (!password) return;
-  const role = prompt("Role (admin/editor/contributor/viewer)", "contributor") || "viewer";
+
+function closeUserModal() {
+  $("#user-modal").classList.add("hidden");
+  editingUserId = null;
+  syncModalState();
+}
+
+function closeDeleteUserModal() {
+  $("#delete-user-modal").classList.add("hidden");
+  pendingDeleteUser = null;
+  syncModalState();
+}
+
+function openUserModal(user = null) {
+  const isEdit = Boolean(user);
+  const isSelf = isEdit && user.id === state.user.id;
+  editingUserId = isEdit ? user.id : null;
+  $("#user-modal-title").textContent = isEdit ? "Edit user" : "Add user";
+  $("#user-username").value = isEdit ? user.username : "";
+  $("#user-username").readOnly = isEdit;
+  $("#user-email").value = isEdit ? (user.email || "") : "";
+  $("#user-full-name").value = isEdit ? (user.full_name || "") : "";
+  $("#user-role").value = isEdit ? user.role : "viewer";
+  $("#user-role").disabled = isSelf;
+  $("#user-active").checked = isEdit ? Boolean(user.is_active) : true;
+  $("#user-active").disabled = isSelf;
+  $("#user-password").value = "";
+  $("#user-password").required = !isEdit;
+  $("#user-password-hint").textContent = isEdit
+    ? "Leave blank to keep the current password. Changing it invalidates existing sessions."
+    : "Required for new users. Changing it invalidates existing sessions.";
+  if (isSelf) {
+    $("#user-password-hint").textContent += " You cannot change your own role or active state.";
+  }
+  $("#user-modal-error").classList.add("hidden");
+  $("#user-modal-error").textContent = "";
+  $("#user-save").disabled = false;
+  $("#user-modal").classList.remove("hidden");
+  syncModalState();
+  $(isEdit ? "#user-email" : "#user-username").focus();
+}
+
+function openDeleteUserModal(user) {
+  if (user.is_active || user.id === state.user.id) return;
+  pendingDeleteUser = user;
+  $("#delete-user-name").textContent = user.username;
+  $("#delete-user-input").value = "";
+  $("#delete-user-confirm").disabled = true;
+  $("#delete-user-error").classList.add("hidden");
+  $("#delete-user-error").textContent = "";
+  $("#delete-user-modal").classList.remove("hidden");
+  syncModalState();
+  $("#delete-user-input").focus();
+}
+
+$("#btn-new-user").addEventListener("click", () => openUserModal());
+$("#user-close").addEventListener("click", closeUserModal);
+$("#user-cancel").addEventListener("click", closeUserModal);
+$("#user-modal .modal-backdrop").addEventListener("click", closeUserModal);
+
+$("#user-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const isEdit = editingUserId !== null;
+  const username = $("#user-username").value.trim();
+  const email = $("#user-email").value.trim();
+  const fullName = $("#user-full-name").value.trim();
+  const role = $("#user-role").value;
+  const active = $("#user-active").checked;
+  const password = $("#user-password").value;
+  const error = $("#user-modal-error");
+  const save = $("#user-save");
+  const isSelf = isEdit && editingUserId === state.user.id;
+
+  error.classList.add("hidden");
+  error.textContent = "";
+  if (!isEdit && !username) {
+    error.textContent = "Username is required.";
+    error.classList.remove("hidden");
+    return;
+  }
+  if (!isEdit && !password) {
+    error.textContent = "Initial password is required.";
+    error.classList.remove("hidden");
+    return;
+  }
+
+  if (isEdit) {
+    const body = { email: email || null, full_name: fullName || null };
+    if (password) body.password = password;
+    if (!isSelf) {
+      body.role = role;
+      body.is_active = active;
+    }
+    save.disabled = true;
+    try {
+      await api("/api/users/" + editingUserId, { method: "PATCH", json: body });
+      const selfPasswordChanged = isSelf && Boolean(password);
+      closeUserModal();
+      toast("User updated");
+      if (selfPasswordChanged) {
+        toast("Password changed. Please sign in again.");
+        logout();
+      } else {
+        await loadUsers();
+      }
+    } catch (err) {
+      error.textContent = err.message || "Could not update the user.";
+      error.classList.remove("hidden");
+      save.disabled = false;
+    }
+  } else {
+    save.disabled = true;
+    try {
+      await api("/api/users", {
+        json: {
+          username,
+          email: email || null,
+          full_name: fullName || null,
+          role,
+          is_active: active,
+          password,
+        },
+      });
+      closeUserModal();
+      toast("User created");
+      await loadUsers();
+    } catch (err) {
+      error.textContent = err.message || "Could not create the user.";
+      error.classList.remove("hidden");
+      save.disabled = false;
+    }
+  }
+});
+
+$("#user-rows").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-user-action]");
+  if (!button) return;
+  const uid = Number(button.dataset.uid);
+  const target = userCache.find(user => user.id === uid);
+  if (!target) return;
+  const action = button.dataset.userAction;
+  if (action === "edit") {
+    openUserModal(target);
+    return;
+  }
+  if (action === "delete") {
+    openDeleteUserModal(target);
+    return;
+  }
+  if (action === "toggle") {
+    const nextActive = !target.is_active;
+    if (!nextActive && !window.confirm(`Deactivate ${target.username}?`)) return;
+    button.disabled = true;
+    try {
+      await api("/api/users/" + uid, { method: "PATCH", json: { is_active: nextActive } });
+      toast(nextActive ? "User enabled" : "User disabled");
+      await loadUsers();
+    } catch (err) {
+      toast(err.message || "Could not update the user.", "err");
+      button.disabled = false;
+    }
+  }
+});
+
+$("#delete-user-input").addEventListener("input", (event) => {
+  const matches = pendingDeleteUser && event.target.value.trim() === pendingDeleteUser.username;
+  $("#delete-user-confirm").disabled = !matches;
+});
+$("#delete-user-close").addEventListener("click", closeDeleteUserModal);
+$("#delete-user-cancel").addEventListener("click", closeDeleteUserModal);
+$("#delete-user-modal .modal-backdrop").addEventListener("click", closeDeleteUserModal);
+$("#delete-user-confirm").addEventListener("click", async () => {
+  if (!pendingDeleteUser) return;
+  const user = pendingDeleteUser;
+  const confirm = $("#delete-user-confirm");
+  const error = $("#delete-user-error");
+  confirm.disabled = true;
+  error.classList.add("hidden");
   try {
-    await api("/api/users", { json: { username, password, role } });
+    await api("/api/users/" + user.id, { method: "DELETE" });
+    closeDeleteUserModal();
+    toast("User permanently deleted");
     await loadUsers();
   } catch (err) {
-    toast(err.message || "Could not create user.", "err");
+    error.textContent = err.message || "Could not delete the user.";
+    error.classList.remove("hidden");
+    confirm.disabled = false;
   }
 });
 
@@ -1247,9 +1615,11 @@ document.addEventListener("keydown", (event) => {
   if (!$("#export-modal").classList.contains("hidden")) {
     closeExportModal();
   } else if (!uploadModal.classList.contains("hidden")) {
-    uploadModal.classList.add("hidden");
-    syncModalState();
-    reloadCurrentPage();
+    closeUploadModal();
+  } else if (!$("#delete-user-modal").classList.contains("hidden")) {
+    closeDeleteUserModal();
+  } else if (!$("#user-modal").classList.contains("hidden")) {
+    closeUserModal();
   } else if (!drawer.classList.contains("hidden")) {
     closeDrawer();
   } else {

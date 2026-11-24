@@ -53,6 +53,8 @@ def test_v0_database_upgrades_without_losing_data():
     )}
     assert "trg_asset_tags_active_insert" in triggers
     assert "trg_assets_deactivate_tags" in triggers
+    user_columns = {r[1] for r in conn.execute("PRAGMA table_info('users')")}
+    assert "token_version" in user_columns
 
 
 def test_migrations_are_idempotent():

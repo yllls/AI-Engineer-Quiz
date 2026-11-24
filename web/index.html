@@ -145,8 +145,10 @@
 
         <div id="view-users" class="view hidden">
           <div class="view-head"><h2>Users</h2><button id="btn-new-user" class="btn">Add user</button></div>
-          <table class="table"><thead><tr><th>User</th><th>Email</th><th>Role</th><th>Active</th><th>Last login</th></tr></thead>
-            <tbody id="user-rows"></tbody></table>
+          <table class="table">
+            <thead><tr><th>User</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
+            <tbody id="user-rows"></tbody>
+          </table>
         </div>
 
         <div id="view-audit" class="view hidden">
@@ -176,8 +178,16 @@
         <p>Drag files here or click to browse</p>
         <input id="file-input" type="file" multiple hidden>
       </div>
-      <label class="check"><input type="checkbox" id="ai-toggle" checked> Run AI enrichment (tags, alt-text)</label>
-      <div id="upload-list" class="upload-list"></div>
+      <div class="upload-options">
+        <label class="filter-field upload-collection-field">Collection
+          <select id="upload-collection" aria-label="Upload destination collection">
+            <option value="">No collection</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="ai-toggle" checked> Run AI enrichment (tags, alt-text)</label>
+      </div>
+      <div id="upload-summary" class="upload-summary muted hidden" role="status"></div>
+      <div id="upload-list" class="upload-list" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="upload-cancel" class="btn btn-ghost">Close</button>
       </div>
@@ -213,6 +223,52 @@
         <button id="export-reset-columns" class="btn btn-ghost" type="button">Reset columns</button>
         <button id="export-cancel" class="btn" type="button">Cancel</button>
         <button id="export-download" class="btn btn-primary" type="button">Download CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- User create/edit modal -->
+  <div id="user-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
+    <div class="modal-backdrop"></div>
+    <div class="modal-card user-card">
+      <button class="x" id="user-close" type="button" aria-label="Close user dialog">&times;</button>
+      <h3 id="user-modal-title">Add user</h3>
+      <form id="user-form" class="user-form">
+        <label>Username<input id="user-username" autocomplete="off" maxlength="120"></label>
+        <label>Email<input id="user-email" type="email" autocomplete="off"></label>
+        <label>Full name<input id="user-full-name" maxlength="200"></label>
+        <label>Role
+          <select id="user-role">
+            <option value="viewer">viewer</option>
+            <option value="contributor">contributor</option>
+            <option value="editor">editor</option>
+            <option value="admin">admin</option>
+          </select>
+        </label>
+        <label class="check user-active-wrap"><input type="checkbox" id="user-active" checked> Active</label>
+        <label>Password<input id="user-password" type="password" autocomplete="new-password"></label>
+        <p id="user-password-hint" class="muted user-form-wide">Required for new users; leave blank to keep the current password.</p>
+        <p id="user-modal-error" class="error user-form-wide hidden" role="alert"></p>
+        <div class="modal-actions user-form-wide">
+          <button id="user-cancel" class="btn" type="button">Cancel</button>
+          <button id="user-save" class="btn btn-primary" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Permanent user deletion confirmation -->
+  <div id="delete-user-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="delete-user-title">
+    <div class="modal-backdrop"></div>
+    <div class="modal-card delete-user-card">
+      <button class="x" id="delete-user-close" type="button" aria-label="Close delete user dialog">&times;</button>
+      <h3 id="delete-user-title">Delete user permanently</h3>
+      <p>This cannot be undone. Type <strong id="delete-user-name"></strong> to confirm.</p>
+      <label>Username<input id="delete-user-input" autocomplete="off"></label>
+      <p id="delete-user-error" class="error hidden" role="alert"></p>
+      <div class="modal-actions">
+        <button id="delete-user-cancel" class="btn" type="button">Cancel</button>
+        <button id="delete-user-confirm" class="btn btn-danger" type="button" disabled>Delete permanently</button>
       </div>
     </div>
   </div>

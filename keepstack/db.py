@@ -198,7 +198,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS asset_fts USING fts5(
 # Schema changes after the original v0 schema live here. Each entry is applied
 # once, in order, and recorded in schema_meta. Keep migrations additive and
 # idempotent: existing installations must upgrade without losing data.
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -273,6 +273,11 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
                SET active_count = MAX(0, active_count - 1)
                WHERE tag_id IN (SELECT tag_id FROM asset_tags WHERE asset_id = OLD.id);
            END""",
+    ),
+    3: (
+        # Password resets and deactivation bump this value, invalidating tokens
+        # issued under an older account state without a server-side session store.
+        "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
     ),
 }
 
