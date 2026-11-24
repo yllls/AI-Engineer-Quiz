@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-os.environ["KEEPSTACK_DATA_DIR"] = tempfile.mkdtemp(prefix="keepstack-test-")
-os.environ["KEEPSTACK_AI_ENABLED"] = "false"
+os.environ.setdefault("KEEPSTACK_DATA_DIR", tempfile.mkdtemp(prefix="keepstack-test-"))
+os.environ.setdefault("KEEPSTACK_AI_ENABLED", "false")
 
 from PIL import Image  # noqa: E402
 
